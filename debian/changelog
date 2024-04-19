@@ -1,0 +1,16 @@
+ros-jazzy-mrpt-path-planning (0.1.1-2bookworm) bookworm; urgency=high
+
+  * Fix usage of obsolete mrpt methods
+  * update ros badges
+  * Contributors: Jose Luis Blanco-Claraco
+
+ -- Jose-Luis Blanco-Claraco <joseluisblancoc@gmail.com>  Tue, 19 Mar 2024 00:00:00 -0000
+
+ros-jazzy-mrpt-path-planning (0.1.0-2bookworm) bookworm; urgency=high
+
+  * First release since initial development in May 2019.
+  * Contributors: Jose Luis Blanco-Claraco, Shravan S Rai
+
+ -- Jose-Luis Blanco-Claraco <joseluisblancoc@gmail.com>  Wed, 14 Jun 2023 00:00:00 -0000
+
+

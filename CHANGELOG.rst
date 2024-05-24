@@ -2,6 +2,18 @@
 Changelog for package mrpt_path_planning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.3 (2024-05-24)
+------------------
+* Update badges for ROS2 distros
+* bump minimum cmake version to 3.5
+* Contributors: Jose Luis Blanco-Claraco
+
+0.1.2 (2024-04-25)
+------------------
+* Fix usage of (new explicit) TPoint3D constructors
+* Update build instructions
+* Contributors: Jose Luis Blanco-Claraco
+
 0.1.1 (2024-03-19)
 ------------------
 * Fix usage of obsolete mrpt methods

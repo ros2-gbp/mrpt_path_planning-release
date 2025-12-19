@@ -2,6 +2,11 @@
 Changelog for package mrpt_path_planning
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.2.4 (2025-12-19)
+------------------
+* Fix build for mrpt >=2.15.3
+* Contributors: Jose Luis Blanco-Claraco
+
 0.2.3 (2025-11-10)
 ------------------
 * Fix usage of new mrpt 2.15.0 API

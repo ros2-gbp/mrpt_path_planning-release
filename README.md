@@ -1,3 +1,26 @@
+## mrpt_path_planning (rolling) - 0.2.5-1
+
+The packages in the `mrpt_path_planning` repository were released into the `rolling` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -r rolling -y mrpt_path_planning` on `Wed, 21 Jan 2026 22:08:21 -0000`
+
+The `mrpt_path_planning` package was released.
+
+Version of package(s) in repository `mrpt_path_planning`:
+
+- upstream repository: https://github.com/MRPT/mrpt_path_planning.git
+- release repository: https://github.com/ros2-gbp/mrpt_path_planning-release.git
+- rosdistro version: `0.2.4-1`
+- old version: `0.2.4-1`
+- new version: `0.2.5-1`
+
+Versions of tools used:
+
+- bloom version: `0.11.2`
+- catkin_pkg version: `0.5.2`
+- rosdep version: `0.22.2`
+- rosdistro version: `0.9.0`
+- vcstools version: `0.1.42`
+
+
 ## mrpt_path_planning (kilted) - 0.2.5-1
 
 The packages in the `mrpt_path_planning` repository were released into the `kilted` distro by running `/home/jlblanco/code/bloom-venv/bin/bloom-release -r kilted -y mrpt_path_planning` on `Wed, 21 Jan 2026 22:07:03 -0000`

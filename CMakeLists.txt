@@ -38,6 +38,7 @@ endif()
 
 # Dependencies:
 find_package(mvsim-simulator QUIET)
+find_package(mvsim-comms QUIET)
 find_package(mrpt-tclap REQUIRED)
 find_package(mrpt-containers REQUIRED)
 find_package(mrpt-graphs REQUIRED)
@@ -51,6 +52,12 @@ add_subdirectory(mrpt_path_planning)
 option(MRPT_PATH_PLANNING_BUILD_APPS "Build mrpt_path_planning cli/gui tools" ON)
 if (MRPT_PATH_PLANNING_BUILD_APPS)
 	add_subdirectory(apps)
+endif()
+
+option(MRPT_PATH_PLANNING_BUILD_TESTS "Build mrpt_path_planning unit tests" ON)
+if (MRPT_PATH_PLANNING_BUILD_TESTS)
+	enable_testing()
+	add_subdirectory(tests)
 endif()
 
 # Summary:

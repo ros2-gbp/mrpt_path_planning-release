@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *   SelfDriving C++ library based on PTGs and mrpt-nav
- * Copyright (C) 2019-2022 Jose Luis Blanco, University of Almeria
+ * Copyright (C) 2019-2026 Jose Luis Blanco, University of Almeria
  * See LICENSE for license information.
  * ------------------------------------------------------------------------- */
 
@@ -57,9 +57,27 @@ struct TPS_Astar_Parameters
 };
 
 /**
- * Uses a SE(2) lattice to run an A* algorithm to find a kinematicaly feasible
+ * Uses a SE(2) lattice to run an A* algorithm to find a kinematically feasible
  * path from "A" to "B" using a set of trajectories in the form of PTGs.
  *
+ * ## Cost model and optimality
+ *
+ * This planner optimizes **SE(2) path cost**, not R(2) path length. The base
+ * edge cost is `estimatedExecTime` (travel time), and the default heuristic
+ * combines a Lie-group distance with a heading-alignment penalty:
+ *
+ *   h = dist_SE2(from, goal) + w * |angDistance(atan2(dy,dx), phi)|
+ *
+ * The heading term is intentional and physically meaningful: for any vehicle
+ * capable of rotation (holonomic, differential-drive, Ackermann), the true
+ * cost-to-go in SE(2) includes the effort to reorient. A path that arrives at
+ * the goal position facing the wrong direction is genuinely more expensive than
+ * one that arrives correctly aligned. The planner therefore finds paths that
+ * are optimal in SE(2), which are not necessarily the shortest in R(2).
+ *
+ * To minimize only R(2) path length (ignoring final heading cost), set:
+ *   - `SE2_metricAngleWeight = 0`
+ *   - `heuristic_heading_weight = 0`
  */
 class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
 {
@@ -221,12 +239,19 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
 
     SE2_Lattice grid_;
 
-    int32_t x2idx(float x) const { return x / params_.grid_resolution_xy; }
-    int32_t y2idx(float y) const { return y / params_.grid_resolution_xy; }
+    int32_t x2idx(float x) const
+    {
+        return static_cast<int32_t>(std::round(x / params_.grid_resolution_xy));
+    }
+    int32_t y2idx(float y) const
+    {
+        return static_cast<int32_t>(std::round(y / params_.grid_resolution_xy));
+    }
     int32_t phi2idx(float yaw) const
     {
-        auto phi = mrpt::math::wrapToPi(yaw);
-        return phi / params_.grid_resolution_yaw;
+        const auto phi = mrpt::math::wrapToPi(yaw);
+        return static_cast<int32_t>(
+            std::round(phi / params_.grid_resolution_yaw));
     }
 
     /// throws on out of grid limits.

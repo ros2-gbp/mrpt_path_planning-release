@@ -1,6 +1,6 @@
 /* -------------------------------------------------------------------------
  *   SelfDriving C++ library based on PTGs and mrpt-nav
- * Copyright (C) 2019-2022 Jose Luis Blanco, University of Almeria
+ * Copyright (C) 2019-2026 Jose Luis Blanco, University of Almeria
  * See LICENSE for license information.
  * ------------------------------------------------------------------------- */
 
@@ -97,14 +97,30 @@ CostEvaluatorCostMap::Ptr CostEvaluatorCostMap::FromStaticPointObstacles(
             const auto d = std::sqrt(obsPts.kdTreeClosestPoint2DsqrError(x, y));
             if (d < D)
             {
-                const auto cost =
-                    p.maxCost * std::pow(-0.99999 + 1. / (d / D), 0.4);
+                // Smooth quadratic decay: maxCost at d=0, zero at d=D.
+                // No singularity and good gradient across the full
+                // clearance zone.
+                const double nd   = 1.0 - d / D;  // in [0,1]
+                const auto   cost = p.maxCost * nd * nd;
                 ASSERT_GE_(cost, .0);
 
                 double* cell = g.cellByIndex(cx, cy);
                 ASSERT_(cell);
                 *cell = cost;
             }
+        }
+    }
+
+    // Ensure cells containing obstacle points have exactly maxCost.
+    // The loop above computes cost from cell centers, which may be slightly
+    // offset from the obstacle, yielding cost < maxCost at the obstacle cell.
+    {
+        const auto& xs = obsPts.getPointsBufferRef_x();
+        const auto& ys = obsPts.getPointsBufferRef_y();
+        for (size_t i = 0; i < xs.size(); i++)
+        {
+            double* cell = g.cellByPos(xs[i], ys[i]);
+            if (cell) *cell = p.maxCost;
         }
     }
 

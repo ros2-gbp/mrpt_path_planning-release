@@ -1,6 +1,6 @@
 ﻿/* -------------------------------------------------------------------------
  *   SelfDriving C++ library based on PTGs and mrpt-nav
- * Copyright (C) 2019-2022 Jose Luis Blanco, University of Almeria
+ * Copyright (C) 2019-2026 Jose Luis Blanco, University of Almeria
  * See LICENSE for license information.
  * ------------------------------------------------------------------------- */
 
@@ -128,9 +128,10 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
         // apply clipping for efficiency:
         // (z is arbitrary and ignored inside)
-        os->apply_clipping_box(mrpt::math::TBoundingBox(
-            {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
-            {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
+        os->apply_clipping_box(
+            mrpt::math::TBoundingBox(
+                {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
+                {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
 
         // Get obstacles:
         obstaclePoints.emplace_back(os->obstacles());
@@ -198,6 +199,14 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
         // node with the lowest fScore:
         Node& current = *openSet.begin()->second.ptr;
+
+        // Skip stale entries: this node was already expanded via a
+        // earlier (better) open-set entry.
+        if (current.visited)
+        {
+            openSet.erase(openSet.begin());
+            continue;
+        }
 
         // current==goal?
         // we must check the state to be on the same lattice cell to check
@@ -300,11 +309,11 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             // rounding differences between the checks in
             // find_feasible_paths_to_neighbors() and the actual PTG path
             // segments.
-            if (q_i.x < in.worldBboxMin.x || q_i.y < in.worldBboxMin.y ||
-                q_i.phi < in.worldBboxMin.phi)
+            // Note: phi is NOT checked here since it lives on S^1 (wraps
+            // at ±π) and cannot meaningfully be bounded linearly.
+            if (q_i.x < in.worldBboxMin.x || q_i.y < in.worldBboxMin.y)
                 continue;
-            if (q_i.x > in.worldBboxMax.x || q_i.y > in.worldBboxMax.y ||
-                q_i.phi > in.worldBboxMax.phi)
+            if (q_i.x > in.worldBboxMax.x || q_i.y > in.worldBboxMax.y)
                 continue;
 
             // Get or create node:
@@ -363,11 +372,11 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
                 heuristic(neighborNode.state, in.stateGoal);
             neighborNode.fScore = tentative_gScore + costToGoal;
 
-            if (!neighborNode.pendingInOpenSet)
-            {
-                neighborNode.pendingInOpenSet = true;
-                openSet.insert({neighborNode.fScore, &neighborNode});
-            }
+            // Always (re-)insert into the open set with the updated
+            // fScore. If an older entry with a higher fScore remains,
+            // it will be skipped when popped via the visited check.
+            neighborNode.pendingInOpenSet = true;
+            openSet.insert({neighborNode.fScore, &neighborNode});
 
             // Overwrite state with new one:
             neighborNode.state = x_i;
@@ -488,8 +497,9 @@ cost_t TPS_Astar::default_heuristic_SE2(
     const double distHeading =
         (relPose.norm() < 0.1)
             ? 0.0
-            : std::abs(mrpt::math::angDistance(
-                  std::atan2(relPose.y, relPose.x), from.pose.phi));
+            : std::abs(
+                  mrpt::math::angDistance(
+                      std::atan2(relPose.y, relPose.x), from.pose.phi));
 
     return distSE2 + params_.heuristic_heading_weight * distHeading;
 }
@@ -497,18 +507,8 @@ cost_t TPS_Astar::default_heuristic_SE2(
 cost_t TPS_Astar::default_heuristic_R2(
     const SE2_KinState& from, const mrpt::math::TPoint2D& goal) const
 {
-    // Distance in R^2:
-    const double distR2 = (from.pose.translation() - goal).norm();
-
-    // Favor heading towards the target, if we are far away:
-    const auto   relPose = goal - from.pose;
-    const double distHeading =
-        (relPose.norm() < 0.1)
-            ? 0.0
-            : std::abs(mrpt::math::angDistance(
-                  std::atan2(relPose.y, relPose.x), from.pose.phi));
-
-    return distR2 + params_.heuristic_heading_weight * distHeading;
+    // Distance in R^2 only — heading is irrelevant for R(2) goals.
+    return (from.pose.translation() - goal).norm();
 }
 
 TPS_Astar::Node& TPS_Astar::getOrCreateNodeByPose(
@@ -727,12 +727,12 @@ TPS_Astar::list_paths_to_neighbors_t
             const auto absPose         = from.state.pose + relReconstrPose;
 
             // out of lattice limits?
-            if (absPose.x < worldBboxMin.x || absPose.y < worldBboxMin.y ||
-                absPose.phi < worldBboxMin.phi)
+            // Note: phi is NOT checked since it lives on S^1 and cannot
+            // be meaningfully bounded with a linear comparison.
+            if (absPose.x < worldBboxMin.x || absPose.y < worldBboxMin.y)
                 continue;
             if (absPose.x > worldBboxMax.x - halfCell ||
-                absPose.y > worldBboxMax.y - halfCell ||
-                absPose.phi > worldBboxMax.phi)
+                absPose.y > worldBboxMax.y - halfCell)
                 continue;
 
             const NodeCoords nc = nodeGridCoords(absPose);

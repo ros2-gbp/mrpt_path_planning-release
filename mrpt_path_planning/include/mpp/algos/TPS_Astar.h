@@ -26,12 +26,45 @@ struct TPS_Astar_Parameters
     TPS_Astar_Parameters() = default;
     static TPS_Astar_Parameters FromYAML(const mrpt::containers::yaml& c);
 
-    double grid_resolution_xy  = 0.20;
-    double grid_resolution_yaw = 5.0_deg;
+    double grid_resolution_xy = 0.20;
+
+    /** Default 7.5 deg (48 yaw bins). A finer 5 deg was found to over-resolve
+     * the yaw dimension: since the heuristic is essentially positional, finer
+     * yaw multiplies SE(2) expansions ~linearly with no quality gain. Measured
+     * (collision-sound, 300-world BARN + 40-case HouseExpo): 5->7.5 deg cuts
+     * mean plan time ~23-37% and HouseExpo median ~1.5x while *improving*
+     * success (BARN 291->292/300, HouseExpo 39->40/40) at unchanged median path
+     * quality. 10 deg is faster still but drops net BARN success, so 7.5 deg is
+     * the sweet spot. See DESIGN.md sec 12.7. */
+    double grid_resolution_yaw = 7.5_deg;
 
     double SE2_metricAngleWeight = 1.0;
 
     double heuristic_heading_weight = 0.1;  //!< [0,1]
+
+    /** Weighted-A* heuristic inflation factor `eps >= 1` (default 1.0 = exact
+     * A*). The open set is ordered by `f = g + eps * h`. Values `> 1` make the
+     * search greedier: it expands far fewer nodes and returns a solution whose
+     * cost is provably within a factor `eps` of the optimum (bounded
+     * sub-optimality, as in ARA* / SBPL). Since the planner's expensive worlds
+     * are dominated by expansion count, `eps` in `[1.5, 2]` is the cheapest
+     * lever to cut the worst-case latency tail at a small, bounded path-cost
+     * increase. Found to be 1.5 to be somehow better in runtime than 1.0 in
+     * general cases. */
+    double heuristic_epsilon = 1.5;
+
+    /** Analytic expansion / early termination:
+     * `find_feasible_paths_to_neighbors` already builds a collision-free
+     * *direct-to-goal* PTG edge (via the PTG inverse map) whenever the goal is
+     * within reach of the node being expanded. When this is enabled (default),
+     * the search terminates the moment such a connection lands in the goal
+     * cell, instead of continuing A* until the goal node is popped as the
+     * lowest-f node. This is the classic analytic-expansion speedup (cf.
+     * Hybrid-A* / Nav2 Smac): it skips the costly final-approach expansions at
+     * the price of accepting the first proven connection to the goal (a small,
+     * bounded optimality relaxation). Set false for strictly optimal (slower)
+     * termination. */
+    bool use_analytic_expansion = true;
 
     uint32_t                        max_ptg_trajectories_to_explore = 20;
     std::vector<duration_seconds_t> ptg_sample_timestamps     = {1.0, 3.0, 5.0};
@@ -92,14 +125,10 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
     PlannerOutput plan(const PlannerInput& in) override;
 
     mrpt::containers::yaml params_as_yaml() override
-    {
-        return params_.as_yaml();
-    }
+    { return params_.as_yaml(); }
 
     void params_from_yaml(const mrpt::containers::yaml& c) override
-    {
-        params_.load_from_yaml(c);
-    }
+    { params_.load_from_yaml(c); }
 
     cost_t default_heuristic(
         const SE2_KinState& from, const SE2orR2_KinState& goal) const;
@@ -178,13 +207,18 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
 
     struct NodeCoordsHash
     {
+        // boost::hash_combine pattern: avalanches bits so that adjacent
+        // integer grid coordinates map to well-separated hash buckets.
+        static void hash_combine(size_t& seed, size_t v)
+        { seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2); }
+
         size_t operator()(const NodeCoords& x) const
         {
-            size_t res = 17;
-            res        = res * 31 + std::hash<int32_t>()(x.idxX);
-            res        = res * 31 + std::hash<int32_t>()(x.idxY);
+            size_t res = 0;
+            hash_combine(res, std::hash<int32_t>()(x.idxX));
+            hash_combine(res, std::hash<int32_t>()(x.idxY));
             if (x.idxYaw)
-                res = res * 31 + std::hash<int32_t>()(x.idxYaw.value());
+                hash_combine(res, std::hash<int32_t>()(x.idxYaw.value()));
             return res;
         }
     };
@@ -240,13 +274,9 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
     SE2_Lattice grid_;
 
     int32_t x2idx(float x) const
-    {
-        return static_cast<int32_t>(std::round(x / params_.grid_resolution_xy));
-    }
+    { return static_cast<int32_t>(std::round(x / params_.grid_resolution_xy)); }
     int32_t y2idx(float y) const
-    {
-        return static_cast<int32_t>(std::round(y / params_.grid_resolution_xy));
-    }
+    { return static_cast<int32_t>(std::round(y / params_.grid_resolution_xy)); }
     int32_t phi2idx(float yaw) const
     {
         const auto phi = mrpt::math::wrapToPi(yaw);
@@ -261,13 +291,9 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
 
     /// throws on out of grid limits.
     NodeCoords nodeGridCoords(const mrpt::math::TPose2D& p) const
-    {
-        return NodeCoords(x2idx(p.x), y2idx(p.y), phi2idx(p.phi));
-    }
+    { return NodeCoords(x2idx(p.x), y2idx(p.y), phi2idx(p.phi)); }
     NodeCoords nodeGridCoords(const mrpt::math::TPoint2D& p) const
-    {
-        return NodeCoords(x2idx(p.x), y2idx(p.y));
-    }
+    { return NodeCoords(x2idx(p.x), y2idx(p.y)); }
 
     struct NodePtr
     {
@@ -330,6 +356,20 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
         const mrpt::math::TPose2D&                      queryPose,
         const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
         double                                          MAX_PTG_XY_DIST);
+
+    /** Maximum linear speed across all active PTGs, cached at the start of
+     *  each plan() call. Used to convert geometric distances (meters) to
+     *  time estimates (seconds) in the heuristic, ensuring admissibility when
+     *  edge costs are in seconds (estimatedExecTime). Defaults to 1.0 so
+     *  that heuristic calls outside plan() return geometric distances. */
+    double maxLinSpeed_ = 1.0;
+
+    /** Cache of local obstacle maps, keyed by (ix, iy) grid cell (no yaw,
+     *  since obstacle clipping only depends on xy position). Cleared at the
+     *  start of each plan() call. Nodes in the same cell share the same
+     *  transformed obstacle cloud, avoiding redundant O(N_obs) transforms. */
+    std::unordered_map<NodeCoords, mrpt::maps::CPointsMap::Ptr, NodeCoordsHash>
+        localObstaclesCache_;
 };
 
 }  // namespace mpp

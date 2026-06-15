@@ -16,6 +16,7 @@
 #include <mrpt/opengl/COpenGLScene.h>
 #include <mrpt/version.h>
 
+#include <cmath>
 #include <iostream>
 #include <unordered_set>
 
@@ -34,6 +35,8 @@ mrpt::containers::yaml TPS_Astar_Parameters::as_yaml()
     MCP_SAVE(c, debugVisualizationShowEdgeCosts);
     MCP_SAVE(c, grid_resolution_xy);
     MCP_SAVE(c, heuristic_heading_weight);
+    MCP_SAVE(c, heuristic_epsilon);
+    MCP_SAVE(c, use_analytic_expansion);
     MCP_SAVE(c, max_ptg_trajectories_to_explore);
     MCP_SAVE(c, max_ptg_speeds_to_explore);
     MCP_SAVE_DEG(c, grid_resolution_yaw);
@@ -66,6 +69,8 @@ void TPS_Astar_Parameters::load_from_yaml(const mrpt::containers::yaml& c)
     MCP_LOAD_OPT(c, saveDebugVisualizationDecimation);
     MCP_LOAD_OPT(c, debugVisualizationShowEdgeCosts);
     MCP_LOAD_OPT(c, heuristic_heading_weight);
+    MCP_LOAD_OPT(c, heuristic_epsilon);
+    MCP_LOAD_OPT(c, use_analytic_expansion);
 
     MCP_LOAD_OPT(c, maximumComputationTime);
 }
@@ -120,6 +125,12 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         mrpt::keep_max(MAX_XY_DIST, ptg->getRefDistance());
     ASSERT_(MAX_XY_DIST > 0);
 
+    // Cache max linear speed for heuristic unit conversion (distance→time).
+    maxLinSpeed_ = 0.0;
+    for (const auto& ptg : in.ptgs.ptgs)
+        mrpt::keep_max(maxLinSpeed_, ptg->getMaxLinVel());
+    if (maxLinSpeed_ <= 0) maxLinSpeed_ = 1.0;  // fallback: units = distance
+
     // obstacles (TODO: dynamic over future time?):
     std::vector<mrpt::maps::CPointsMap::Ptr> obstaclePoints;
     for (const auto& os : in.obstacles)
@@ -128,10 +139,9 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
         // apply clipping for efficiency:
         // (z is arbitrary and ignored inside)
-        os->apply_clipping_box(
-            mrpt::math::TBoundingBox(
-                {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
-                {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
+        os->apply_clipping_box(mrpt::math::TBoundingBox(
+            {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
+            {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
 
         // Get obstacles:
         obstaclePoints.emplace_back(os->obstacles());
@@ -142,6 +152,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
     tree.edges_to_children.clear();
 
     grid_.clear();
+    localObstaclesCache_.clear();
 
     // ----------------------------------------
     //
@@ -163,7 +174,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         tree.insert_root_node(tree.root, n.state);
 
         n.gScore           = 0;
-        n.fScore           = heuristic(n.state, in.stateGoal);
+        n.fScore = params_.heuristic_epsilon * heuristic(n.state, in.stateGoal);
         n.pendingInOpenSet = true;
 
         openSet.insert({n.fScore, &n});
@@ -182,14 +193,28 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             ? nodeGridCoords(in.stateGoal.state.point())
             : nodeGridCoords(in.stateGoal.state.pose());
 
-    // goal speed=0
-    MRPT_TODO("Actually check user input on desired speed at goal");
+    // Desired speed at goal, stored as **absolute linear speed in m/s**.
+    // Each PTG normalises this against its own v_max when it reads the map
+    // (see find_feasible_paths_to_neighbors).  Only the XY linear component
+    // is used; a purely-angular exit velocity maps to 0 (stop) because
+    // PTG targetRelSpeed is a linear-speed modifier.
     nodes_with_desired_speed_t nodesWithDesiredSpeed;
-    nodesWithDesiredSpeed[goalCellIndices] = 0;
+    nodesWithDesiredSpeed[goalCellIndices] =
+        std::hypot(in.stateGoal.vel.vx, in.stateGoal.vel.vy);
 
     unsigned int nIter = 0;
 
     double tLastCallback = planInitTime;
+
+    // Defer building per-edge interpolated paths during the search: it is a
+    // major cost (a std::map per edge) and is only needed for (a) cost
+    // evaluators that score edges, (b) debug visualization, or (c) progress
+    // callbacks that inspect the partial path. When none of these apply, we
+    // store only estimatedExecTime during the search and interpolate just the
+    // final solution edges at the end.
+    const bool deferInterpolation =
+        costEvaluators_.empty() &&
+        params_.saveDebugVisualizationDecimation == 0 && !progressCallback_;
 
     while (!openSet.empty())
     {
@@ -275,6 +300,11 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
                   << "\n";
 #endif
 
+        // Analytic expansion / early termination: if one of the feasible edges
+        // is a collision-free connection that lands in the goal cell, accept it
+        // and stop, instead of continuing A* until the goal node is popped.
+        Node* analyticGoalNode = nullptr;
+
         for (const auto& edge : neighbors)
         {
             // d(current,neighbor) is the weight of the edge from current to
@@ -332,8 +362,9 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             newEdge.ptgIndex     = edge.ptgIndex.value();
             newEdge.ptgPathIndex = edge.ptgTrajIndex.value();
 
-            newEdge.ptgTrimmableSpeed    = edge.ptgTrimmableSpeed;
-            newEdge.ptgFinalGoalRelSpeed = 0;
+            newEdge.ptgTrimmableSpeed = edge.ptgTrimmableSpeed;
+            newEdge.ptgFinalGoalRelSpeed =
+                edge.ptgDynState.value().targetRelSpeed;
             newEdge.ptgFinalRelativeGoal =
                 in.stateGoal.asSE2KinState().pose - current.state.pose;
 
@@ -341,13 +372,24 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             newEdge.ptgInternalState =
                 ptg.getCurrentNavDynamicState().internalState;
 #endif
-            newEdge.stateFrom = current.state;
-            newEdge.stateTo   = x_i;
+            newEdge.stateFrom    = current.state;
+            newEdge.stateTo      = x_i;
+            newEdge.ptgStepIndex = ptg_step;
 
-            // interpolated path:
-            edge_interpolated_path(
-                newEdge, in.ptgs, reconstrRelPose, ptg_step,
-                params_.pathInterpolatedSegments);
+            // interpolated path (deferred to the final solution when possible,
+            // see `deferInterpolation`): otherwise set the cheap exec-time
+            // only.
+            if (deferInterpolation)
+            {
+                newEdge.estimatedExecTime =
+                    ptg_step * ptg.getPathStepDuration();
+            }
+            else
+            {
+                edge_interpolated_path(
+                    newEdge, in.ptgs, reconstrRelPose, ptg_step,
+                    params_.pathInterpolatedSegments);
+            }
 
             // Let's compute its cost:
             newEdge.cost = cost_path_segment(newEdge);
@@ -367,10 +409,14 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             neighborNode.cameFrom = &current;
             neighborNode.gScore   = tentative_gScore;
 
-            // fScore[neighbor] := tentative_gScore + h(neighbor)
+            // fScore[neighbor] := tentative_gScore + eps * h(neighbor).
+            // Weighted A* (eps>=1): inflating only the OPEN ordering, NOT the
+            // raw costToGoal kept below for best-node tracking, yields a
+            // solution within eps of optimal (ARA*/SBPL-style).
             const cost_t costToGoal =
                 heuristic(neighborNode.state, in.stateGoal);
-            neighborNode.fScore = tentative_gScore + costToGoal;
+            neighborNode.fScore =
+                tentative_gScore + params_.heuristic_epsilon * costToGoal;
 
             // Always (re-)insert into the open set with the updated
             // fScore. If an older entry with a higher fScore remains,
@@ -406,7 +452,41 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
                 po.bestNodeId           = neighborNode.id.value();
             }
 
+            // Analytic expansion: this accepted edge connects (collision-free)
+            // into the goal cell. Stop here and finish.
+            if (params_.use_analytic_expansion &&
+                edge.neighborNodeCoords.sameLocation(goalCellIndices))
+            {
+                analyticGoalNode = &neighborNode;
+                break;
+            }
+
         }  // end for each edge to neighbor
+
+        // Early termination via analytic expansion (see above): splice the
+        // goal node exactly like the goal-cell pop below, and finish.
+        if (analyticGoalNode != nullptr)
+        {
+            Node& gn = *analyticGoalNode;
+            if (in.stateGoal.state.isPoint())
+            {
+                const auto& goalPt = in.stateGoal.state.point();
+                gn.state.pose.x    = goalPt.x;
+                gn.state.pose.y    = goalPt.y;
+            }
+            else { gn.state.pose = in.stateGoal.state.pose(); }
+            tree.node_state(*gn.id).pose = gn.state.pose;
+
+            nodeGoal                = &gn;
+            po.goalNodeId           = gn.id.value();
+            po.bestNodeId           = po.goalNodeId;
+            po.bestNodeIdCostToGoal = 0;
+
+            MRPT_LOG_DEBUG_STREAM(
+                "Analytic expansion: early termination, goal reached at "
+                << gn.state.asString());
+            break;  // out of the A* while loop
+        }
 
         MRPT_LOG_DEBUG_FMT(
             "iter: %4u %65s neighbors=%3u fS=%.02f gS=%.02f |openSet|=%u",
@@ -461,6 +541,25 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
     }  // end while openSet!=empty
 
+    // If interpolation was deferred during the search, build it now for just
+    // the final solution-path edges (needed for output / refinement / exec).
+    if (deferInterpolation && po.bestNodeId.has_value() &&
+        po.goalNodeId == po.bestNodeId)
+    {
+        const auto [solNodes, solEdges] =
+            tree.backtrack_path(po.bestNodeId.value());
+        for (auto* e : solEdges)
+        {
+            if (e == nullptr) { continue; }
+            // Recover the relative reconstruction pose (stateTo in the frame
+            // of stateFrom); identical to what was used during the search.
+            const auto reconstrRelPose = e->stateTo.pose - e->stateFrom.pose;
+            edge_interpolated_path(
+                *e, in.ptgs, reconstrRelPose, e->ptgStepIndex,
+                params_.pathInterpolatedSegments);
+        }
+    }
+
     // A* ended, now collect the result:
     // ----------------------------------------
 #if 0  // debug: dump tree
@@ -497,18 +596,22 @@ cost_t TPS_Astar::default_heuristic_SE2(
     const double distHeading =
         (relPose.norm() < 0.1)
             ? 0.0
-            : std::abs(
-                  mrpt::math::angDistance(
-                      std::atan2(relPose.y, relPose.x), from.pose.phi));
+            : std::abs(mrpt::math::angDistance(
+                  std::atan2(relPose.y, relPose.x), from.pose.phi));
 
-    return distSE2 + params_.heuristic_heading_weight * distHeading;
+    cost_t h = (distSE2 + params_.heuristic_heading_weight * distHeading) /
+               maxLinSpeed_;
+
+    return h;
 }
 
 cost_t TPS_Astar::default_heuristic_R2(
     const SE2_KinState& from, const mrpt::math::TPoint2D& goal) const
 {
     // Distance in R^2 only — heading is irrelevant for R(2) goals.
-    return (from.pose.translation() - goal).norm();
+    cost_t h = (from.pose.translation() - goal).norm() / maxLinSpeed_;
+
+    return h;
 }
 
 TPS_Astar::Node& TPS_Astar::getOrCreateNodeByPose(
@@ -593,14 +696,13 @@ TPS_Astar::list_paths_to_neighbors_t
             if (const auto it = nodesWithSpeed.find(iGoalCoords);
                 it != nodesWithSpeed.end())
             {
-                MRPT_TODO("Speed zone filter here too?");
-                ds.targetRelSpeed = it->second;
+                // it->second is an absolute speed (m/s); normalise against
+                // this PTG's own maximum linear velocity so that the result
+                // is in [0, 1] regardless of the robot's top speed.
+                const double ptgVmax = std::max(ptg->getMaxLinVel(), 1e-6);
+                ds.targetRelSpeed    = std::min(1.0, it->second / ptgVmax);
             }
-            else
-            {
-                MRPT_TODO("Support case of final goal speed!=0 ?");
-                ds.targetRelSpeed = 0;
-            }
+            else { ds.targetRelSpeed = 0; }
 
             mrpt::system::CTimeLoggerEntry tle3(
                 profiler_(), "find_feasible.ptgUpdateDyn");
@@ -703,6 +805,31 @@ TPS_Astar::list_paths_to_neighbors_t
 
         std::unordered_set<NodeCoords, NodeCoordsHash> goalNodeCoords;
 
+        // Build the full TP-obstacle free-distance array ONCE for this PTG at
+        // this node, in a single pass over the local obstacle cloud:
+        // updateTPObstacle() fills the collision-free distance for ALL
+        // trajectory directions `k` per obstacle point (one collision-grid
+        // lookup yields all k). This replaces the former pattern of re-scanning
+        // the whole cloud once per candidate trajectory, which was the dominant
+        // planner cost (O(candidates x N_points) -> O(N_points)). The collision
+        // grid is purely geometric, so the result is independent of the
+        // trimmable speed and of the timestamp, and can be shared by all
+        // candidates of this PTG.
+        std::vector<double> tpObstacles;
+        {
+            mrpt::system::CTimeLoggerEntry tleObsAll(
+                profiler_(), "find_feasible.tp_obstacles_all");
+
+            ptg->initTPObstacles(tpObstacles);
+            const auto&  ox   = localObstacles->getPointsBufferRef_x();
+            const auto&  oy   = localObstacles->getPointsBufferRef_y();
+            const size_t nObs = localObstacles->size();
+            for (size_t i = 0; i < nObs; i++)
+            {
+                ptg->updateTPObstacle(ox[i], oy[i], tpObstacles);
+            }
+        }
+
         // now, check which ones of those paths are not blocked by
         // obstacles:
         for (size_t tpsPtIdx = 0; tpsPtIdx < tpsPointsToConsider.size();
@@ -737,14 +864,9 @@ TPS_Astar::list_paths_to_neighbors_t
 
             const NodeCoords nc = nodeGridCoords(absPose);
 
-            mrpt::system::CTimeLoggerEntry tleObs(
-                profiler_(), "find_feasible.tp_obstacles_single");
-
-            // check for collisions:
-            const distance_t freeDistance =
-                tp_obstacles_single_path(tpsPt.k, *localObstacles, *ptg);
-
-            tleObs.stop();
+            // check for collisions: read the precomputed free distance for
+            // this trajectory direction (built once above for all candidates).
+            const distance_t freeDistance = tpObstacles[tpsPt.k];
 
             if (relTrgDist >= freeDistance)
             {
@@ -793,6 +915,11 @@ TPS_Astar::list_paths_to_neighbors_t
                 path.relTrgStep         = tpsPt.step;
                 path.neighborNodeCoords = nc;
                 path.ptgDynState        = ptg->getCurrentNavDynamicState();
+                // Must store the speed that was active during collision
+                // evaluation (applied via ptgTrimmable->trimmableSpeed_ above);
+                // without this, ptgTrimmableSpeed keeps its default of 1.0 and
+                // the trimmed speed used to win this best-path slot is lost.
+                path.ptgTrimmableSpeed = tpsPt.speed;
             }
         }
 
@@ -832,16 +959,62 @@ mrpt::maps::CPointsMap::Ptr TPS_Astar::cached_local_obstacles(
 {
     mrpt::system::CTimeLoggerEntry tle(profiler_(), "cached_local_obstacles");
 
-    MRPT_TODO("Impl actual cache");
+    // Only the *clipping* of the global obstacle set to a local window depends
+    // solely on the xy cell, so that (expensive, O(N_global)) step is cached
+    // per (ix,iy). The subsequent rigid transform into the robot-local frame
+    // DEPENDS ON HEADING and must NOT be cached across headings: doing so
+    // (former behavior, keyed by xy only) reused obstacles rotated for a
+    // different heading, yielding collision FALSE NEGATIVES (the planner could
+    // tunnel through walls). So we transform the small clipped subset per call.
+    const NodeCoords key(x2idx(queryPose.x), y2idx(queryPose.y));
 
-    auto outObs = mrpt::maps::CSimplePointsMap::Create();
-
-    for (const auto& obs : globalObstacles)
+    mrpt::maps::CPointsMap::Ptr clippedGlobal;
+    if (auto it = localObstaclesCache_.find(key);
+        it != localObstaclesCache_.end())
     {
-        ASSERT_(obs);
-        transform_pc_square_clipping(
-            *obs, mrpt::poses::CPose2D(queryPose), MAX_PTG_XY_DIST, *outObs);
+        clippedGlobal = it->second;
+    }
+    else
+    {
+        // Clip (keeping GLOBAL coordinates) to a square around the cell center,
+        // enlarged by half a cell so the cached subset is a valid superset for
+        // any exact pose falling in this cell.
+        const double res = params_.grid_resolution_xy;
+        const double cx  = key.idxX * res;
+        const double cy  = key.idxY * res;
+        const double win = MAX_PTG_XY_DIST + 0.5 * res;
+
+        clippedGlobal = mrpt::maps::CSimplePointsMap::Create();
+        for (const auto& obs : globalObstacles)
+        {
+            ASSERT_(obs);
+            const auto&  xs = obs->getPointsBufferRef_x();
+            const auto&  ys = obs->getPointsBufferRef_y();
+            const size_t n  = obs->size();
+            for (size_t i = 0; i < n; i++)
+            {
+                if (std::abs(xs[i] - cx) <= win && std::abs(ys[i] - cy) <= win)
+                {
+                    clippedGlobal->insertPointFast(xs[i], ys[i], 0);
+                }
+            }
+        }
+        localObstaclesCache_.emplace(key, clippedGlobal);
     }
 
-    return outObs;
+    // Per-call: rigid-transform the small clipped subset into the robot-local
+    // frame of `queryPose` (translation + rotation by heading).
+    auto         local = mrpt::maps::CSimplePointsMap::Create();
+    const auto   inv   = -mrpt::poses::CPose2D(queryPose);
+    const auto&  xs    = clippedGlobal->getPointsBufferRef_x();
+    const auto&  ys    = clippedGlobal->getPointsBufferRef_y();
+    const size_t n     = clippedGlobal->size();
+    local->reserve(n);
+    for (size_t i = 0; i < n; i++)
+    {
+        double ox = 0, oy = 0;
+        inv.composePoint(xs[i], ys[i], ox, oy);
+        local->insertPointFast(ox, oy, 0);
+    }
+    return local;
 }

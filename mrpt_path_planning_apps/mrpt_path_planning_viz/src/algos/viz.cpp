@@ -1,0 +1,247 @@
+/* -------------------------------------------------------------------------
+ *   SelfDriving C++ library based on PTGs and mrpt-nav
+ * Copyright (C) 2019-2026 Jose Luis Blanco, University of Almeria
+ * See LICENSE for license information.
+ * ------------------------------------------------------------------------- */
+
+#include <mpp/algos/render_tree.h>
+#include <mpp/algos/trajectories.h>
+#include <mpp/algos/viz.h>
+#include <mrpt/gui/CDisplayWindow3D.h>
+#include <mrpt/math/TLine3D.h>
+#include <mrpt/math/TObject3D.h>
+#include <mrpt/math/TPlane.h>
+#include <mrpt/math/geometry.h>
+#include <mrpt/poses/CPose2DInterpolator.h>
+#include <mrpt/system/CTicTac.h>
+#include <mrpt/viz/CCylinder.h>
+#include <mrpt/viz/CGridPlaneXY.h>
+#include <mrpt/viz/CSetOfLines.h>
+#include <mrpt/viz/CSetOfObjects.h>
+#include <mrpt/viz/Scene.h>
+#include <mrpt/viz/stock_objects.h>
+
+#include <thread>
+
+using namespace mpp;
+
+// Non-modal calls reuse this single window instead of piling up a new one
+// per call (the caller, e.g. a planner node re-planning on every request,
+// may call viz_nav_plan() many times over the node's lifetime).
+static mrpt::gui::CDisplayWindow3D::Ptr nonmodal_win;
+
+namespace
+{
+// Shows the (X,Y) ground-plane coordinates the mouse is pointing at, as a
+// 2D text message overlaid on the 3D view.
+//
+// get3DRayForPixelCoord() converts the pixel coordinate using the
+// render-matrices cached for the *calling* thread, which are only correctly
+// populated with the actual (and possibly resized) viewport size on the
+// window's GUI/render thread. Hence the whole computation is run there via
+// sendFunctionToRunOnGUIThread().
+void updateMouseCoordinatesTextMessage(mrpt::gui::CDisplayWindow3D& win)
+{
+    win.sendFunctionToRunOnGUIThread(
+        [&win]()
+        {
+            const auto mousePos = win.getLastMousePosition();
+            if (!mousePos.has_value()) return;
+
+            mrpt::viz::Scene::Ptr              scene;
+            std::optional<mrpt::math::TLine3D> mouseRay;
+            {
+                mrpt::gui::CDisplayWindow3DLocker dwl(win, scene);
+                if (auto vp = scene->getViewport("main"); vp)
+                {
+                    mouseRay = vp->get3DRayForPixelCoord(*mousePos);
+                }
+            }
+            if (!mouseRay.has_value()) return;
+
+            // Intersection of the mouse ray with the ground plane Z=0:
+            using mrpt::math::TPoint3D;
+            const mrpt::math::TPlane groundPlane(
+                TPoint3D(0, 0, 0), TPoint3D(1, 0, 0), TPoint3D(0, 1, 0));
+
+            mrpt::math::TObject3D inters;
+            mrpt::math::intersect(*mouseRay, groundPlane, inters);
+
+            mrpt::math::TPoint3D pt;
+            if (!inters.getPoint(pt)) return;
+
+            win.addTextMessage(
+                0.01, 0.01, mrpt::format("Mouse: X=%.3f Y=%.3f", pt.x, pt.y),
+                0 /*unique_index*/);
+        });
+}
+}  // namespace
+
+void mpp::viz_nav_plan(
+    const mpp::PlannerOutput& plan, const mpp::VisualizationOptions& opts,
+    const std::vector<CostEvaluator::Ptr> costEvaluators)
+{
+    MRPT_START
+
+    const std::string title =
+        !opts.windowTitle.empty() ? opts.windowTitle : "Path plan viz";
+
+    mrpt::gui::CDisplayWindow3D::Ptr win;
+    if (opts.gui_modal)
+    {
+        // Modal calls block until the user closes the window, so there is
+        // no benefit (and no way) to reuse a previous one.
+        win = mrpt::gui::CDisplayWindow3D::Create(title, 800, 600);
+    }
+    else
+    {
+        if (!nonmodal_win || !nonmodal_win->isOpen())
+        {
+            nonmodal_win = mrpt::gui::CDisplayWindow3D::Create(title, 800, 600);
+        }
+        else { nonmodal_win->setWindowTitle(title); }
+        win = nonmodal_win;
+    }
+
+    mrpt::viz::Scene::Ptr scene;
+
+    // Build opengl scene (replacing any previous contents, if this window is
+    // being reused across calls):
+    {
+        mrpt::gui::CDisplayWindow3DLocker dwl(*win, scene);
+        scene->clear();
+
+        auto glTree = render_tree(
+            plan.motionTree, plan.originalInput, opts.renderOptions);
+        scene->insert(glTree);
+
+        for (const auto& ce : costEvaluators)
+        {
+            if (!ce) continue;
+            scene->insert(ce->get_visualization());
+        }
+    }
+
+    // Camera:
+    win->setCameraAzimuthDeg(-90);
+    win->setCameraElevationDeg(90);
+    win->setProjectiveModel(false);
+
+    // Look at path start:
+    const auto& start = plan.originalInput.stateStart.pose;
+    win->setCameraPointingToPoint(start.x, start.y, .0f);
+
+    // Render:
+    win->updateWindow();
+
+    if (opts.gui_modal)
+    {
+        // Wait for the user to close the window or press a key, while
+        // showing the (X,Y) ground coordinates under the mouse cursor:
+        while (win->isOpen() && !win->keyHit())
+        {
+            updateMouseCoordinatesTextMessage(*win);
+            win->updateWindow();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    // else: non-modal window is already kept alive via nonmodal_win, above.
+
+    MRPT_END
+}
+
+void mpp::viz_nav_plan_animation(
+    const PlannerOutput& plan, const mpp::trajectory_t& traj,
+    const RenderOptions&                  opts,
+    const std::vector<CostEvaluator::Ptr> costEvaluators)
+{
+    MRPT_START
+
+    ASSERT_(!traj.empty());
+
+    // Path interpolation:
+    mrpt::poses::CPose2DInterpolator trajPath;
+    for (const auto& kv : traj)
+    {
+        // NOTE: These are "fake" timestamps, but it's ok (they are at the
+        // beginning of UNIX epoch).
+        const auto t = mrpt::Clock::fromDouble(kv.first);
+
+        trajPath.insert(t, kv.second.state.pose);
+    }
+    trajPath.setInterpolationMethod(
+        mrpt::poses::TInterpolatorMethod::imLinearSlerp);
+
+    // Create UI:
+    auto win = mrpt::gui::CDisplayWindow3D::Create("Path plan viz", 800, 600);
+
+    mrpt::viz::Scene::Ptr scene;
+
+    auto glVehFrame = mrpt::viz::CSetOfObjects::Create();
+    auto glVeh      = mrpt::viz::CSetOfObjects::Create();
+
+    auto glRobotShape = mrpt::viz::CSetOfLines::Create();
+    plan.originalInput.ptgs.ptgs.front()->add_robotShape_to_setOfLines(
+        *glRobotShape);
+    glRobotShape->setColor_u8(0xff, 0x00, 0x00, 0xff);  // RGB+A
+    glVeh->insert(glRobotShape);
+    auto glVehCorner = mrpt::viz::stock_objects::CornerXYZ(0.3);
+    glVeh->insert(glVehCorner);
+
+    glVehFrame->insert(glVeh);
+
+    // Build opengl scene:
+    {
+        mrpt::gui::CDisplayWindow3DLocker dwl(*win, scene);
+
+        auto glTree = render_tree(plan.motionTree, plan.originalInput, opts);
+        scene->insert(glTree);
+        scene->insert(glVehFrame);
+
+        for (const auto& ce : costEvaluators)
+        {
+            if (!ce) continue;
+            scene->insert(ce->get_visualization());
+        }
+    }
+
+    // Camera:
+    win->setCameraAzimuthDeg(-90);
+    win->setCameraElevationDeg(90);
+    win->setProjectiveModel(false);
+    // Look at path start:
+    const auto& start = plan.originalInput.stateStart.pose;
+    win->setCameraPointingToPoint(start.x, start.y, .0f);
+
+    // Render:
+    win->updateWindow();
+
+    // Wait for window close and run animation in the meanwhile:
+    mrpt::system::CTicTac stopWatch;
+
+    while (win->isOpen())
+    {
+        // find pose at this moment in time:
+        const double        t = stopWatch.Tac();
+        mrpt::math::TPose2D vehPose;
+        bool                validInterp = false;
+        trajPath.interpolate(mrpt::Clock::fromDouble(t), vehPose, validInterp);
+        if (validInterp)
+        {
+            mrpt::gui::CDisplayWindow3DLocker dwl(*win, scene);
+            glVeh->setPose(vehPose);
+        }
+        // time wrap:
+        if (t > mrpt::Clock::toDouble(trajPath.rbegin()->first))
+            stopWatch.Tic();  // reset to t=0
+
+        // Show the (X,Y) ground coordinates under the mouse cursor:
+        updateMouseCoordinatesTextMessage(*win);
+
+        // refresh:
+        win->updateWindow();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    MRPT_END
+}

@@ -1,18 +1,16 @@
-project(mrpt_path_planning LANGUAGES CXX)
+# ------------------------------------------------------------------------------
+#  mrpt_path_planning metapackage
+#
+#  Kept for backward compatibility: depends on mrpt_path_planning_core and
+#  mrpt_path_planning_apps, so existing <depend>mrpt_path_planning</depend>
+#  consumers keep building/installing the exact same set of libraries and
+#  applications as before.
+# ------------------------------------------------------------------------------
+cmake_minimum_required(VERSION 3.22...3.31)
 
-file(GLOB_RECURSE LIB_SRCS src/*.cpp src/*.h)
-file(GLOB_RECURSE LIB_PUBLIC_HDRS include/*.h)
+project(mrpt_path_planning NONE)
 
-# define lib:
-selfdriving_add_library(
-	TARGET
-		mrpt_path_planning
-	SOURCES
-		${LIB_SRCS} ${LIB_PUBLIC_HDRS}
-	PUBLIC_LINK_LIBRARIES 
-		mrpt::nav mrpt::graphs mrpt::containers mrpt::gui mrpt::maps
-#	[PRIVATE_LINK_LIBRARIES lib3 lib4]
-	CMAKE_DEPENDENCIES 
-		mrpt-containers mrpt-graphs mrpt-gui mrpt-nav
-)
-
+# This is a metapackage: there are no targets, no sources to build. The
+# install() call below has nothing to copy; it only exists so CMake
+# generates an "install" target (colcon otherwise warns that there's none).
+install(DIRECTORY DESTINATION share/${PROJECT_NAME})

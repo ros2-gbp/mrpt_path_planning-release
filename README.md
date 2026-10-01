@@ -1,3 +1,29 @@
+## mrpt_path_planning (humble) - 2.0.0-1
+
+The packages in the `mrpt_path_planning` repository were released into the `humble` distro by running `/usr/bin/bloom-release --rosdistro humble --track humble mrpt_path_planning` on `Thu, 01 Oct 2026 11:53:41 -0000`
+
+These packages were released:
+- `mrpt_path_planning`
+- `mrpt_path_planning_apps`
+- `mrpt_path_planning_core`
+
+Version of package(s) in repository `mrpt_path_planning`:
+
+- upstream repository: https://github.com/MRPT/mrpt_path_planning.git
+- release repository: https://github.com/ros2-gbp/mrpt_path_planning-release.git
+- rosdistro version: `1.0.1-1`
+- old version: `1.0.1-1`
+- new version: `2.0.0-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.4`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## mrpt_path_planning (jazzy) - 2.0.0-1
 
 The packages in the `mrpt_path_planning` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release --rosdistro jazzy --track jazzy mrpt_path_planning` on `Thu, 01 Oct 2026 11:52:05 -0000`

@@ -1,0 +1,13 @@
+Source: ros-kilted-mrpt-path-planning-apps
+Section: misc
+Priority: optional
+Maintainer: "Jose-Luis Blanco-Claraco" <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, libcli11-dev, ros-kilted-mrpt-gui, ros-kilted-mrpt-nav, ros-kilted-mrpt-path-planning-core, ros-kilted-mvsim, ros-kilted-ros-workspace
+Homepage: https://github.com/MRPT/mrpt_path_planning
+Standards-Version: 3.9.2
+
+Package: ros-kilted-mrpt-path-planning-apps
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcli11-dev, ros-kilted-mrpt-gui, ros-kilted-mrpt-nav, ros-kilted-mrpt-path-planning-core, ros-kilted-mvsim, ros-kilted-ros-workspace
+Description: CLI and GUI applications for mrpt_path_planning: path-planner-cli (opens a 3D viz window) and selfdriving-simulator-gui (requires mvsim).
+ Kept in a separate package from mrpt_path_planning_core so headless consumers don't need to pull in mrpt_libgui.

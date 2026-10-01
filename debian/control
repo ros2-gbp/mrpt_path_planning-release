@@ -1,0 +1,12 @@
+Source: ros-jazzy-mrpt-path-planning
+Section: misc
+Priority: optional
+Maintainer: "Jose-Luis Blanco-Claraco" <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, ros-jazzy-mrpt-path-planning-apps, ros-jazzy-mrpt-path-planning-core, ros-jazzy-ros-workspace
+Homepage: https://github.com/MRPT/mrpt_path_planning
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-mrpt-path-planning
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-mrpt-path-planning-apps, ros-jazzy-mrpt-path-planning-core, ros-jazzy-ros-workspace
+Description: Metapackage for mrpt_path_planning: depends on mrpt_path_planning_core (headless path-planning library) and mrpt_path_planning_apps (CLI/GUI applications).

@@ -41,6 +41,12 @@ mrpt::math::TPose2D integrateUnicycle(
     }
     return {x, y, mrpt::math::wrapToPi(phi)};
 }
+
+// Consecutive path points closer than this are merged [m]:
+constexpr double kMinKnotDist = 0.01;
+
+// Heading change within kMinKnotDist that makes a pivot [rad]:
+constexpr double kPivotMinAngle = mrpt::DEG2RAD(10.0);
 }  // namespace
 
 TrajectoryFollower::TrajectoryFollower()
@@ -56,6 +62,11 @@ void TrajectoryFollower::Parameters::load_from_yaml(
     MCP_LOAD_OPT(c, max_accel);
     MCP_LOAD_OPT(c, max_decel);
     MCP_LOAD_OPT(c, max_lateral_accel);
+    MCP_LOAD_OPT(c, max_omega);
+    MCP_LOAD_OPT(c, curvature_preview);
+    MCP_LOAD_OPT(c, curvature_feedforward);
+    MCP_LOAD_OPT(c, actuation_lag);
+    MCP_LOAD_OPT(c, control_delay);
     MCP_LOAD_OPT(c, min_turn_radius);
     MCP_LOAD_OPT(c, max_omega_rate);
     MCP_LOAD_OPT(c, max_curvature_rate);
@@ -73,6 +84,9 @@ void TrajectoryFollower::Parameters::load_from_yaml(
     MCP_LOAD_OPT(c, anchor_max_lin_divergence);
     MCP_LOAD_OPT(c, anchor_max_ang_divergence);
     MCP_LOAD_OPT(c, arrival_radius);
+    MCP_LOAD_OPT_DEG(c, arrival_ang_tol);
+    MCP_LOAD_OPT(c, rotate_at_goal);
+    MCP_LOAD_OPT(c, pivot_in_place);
     MCP_LOAD_OPT(c, control_period);
     MCP_LOAD_OPT(c, horizon);
     MCP_LOAD_OPT(c, sample_period);
@@ -84,6 +98,7 @@ void TrajectoryFollower::Parameters::load_from_yaml(
     MCP_LOAD_OPT(c, reference_lookahead_dist);
     MCP_LOAD_OPT(c, footprint_sample_resolution);
     MCP_LOAD_OPT(c, resume_scale);
+    MCP_LOAD_OPT(c, safety_min_speed);
     MCP_LOAD_OPT(c, block_timeout);
 }
 
@@ -94,6 +109,11 @@ mrpt::containers::yaml TrajectoryFollower::Parameters::as_yaml() const
     MCP_SAVE(c, max_accel);
     MCP_SAVE(c, max_decel);
     MCP_SAVE(c, max_lateral_accel);
+    MCP_SAVE(c, max_omega);
+    MCP_SAVE(c, curvature_preview);
+    MCP_SAVE(c, curvature_feedforward);
+    MCP_SAVE(c, actuation_lag);
+    MCP_SAVE(c, control_delay);
     MCP_SAVE(c, min_turn_radius);
     MCP_SAVE(c, max_omega_rate);
     MCP_SAVE(c, max_curvature_rate);
@@ -111,6 +131,9 @@ mrpt::containers::yaml TrajectoryFollower::Parameters::as_yaml() const
     MCP_SAVE(c, anchor_max_lin_divergence);
     MCP_SAVE(c, anchor_max_ang_divergence);
     MCP_SAVE(c, arrival_radius);
+    MCP_SAVE_DEG(c, arrival_ang_tol);
+    MCP_SAVE(c, rotate_at_goal);
+    MCP_SAVE(c, pivot_in_place);
     MCP_SAVE(c, control_period);
     MCP_SAVE(c, horizon);
     MCP_SAVE(c, sample_period);
@@ -122,6 +145,7 @@ mrpt::containers::yaml TrajectoryFollower::Parameters::as_yaml() const
     MCP_SAVE(c, reference_lookahead_dist);
     MCP_SAVE(c, footprint_sample_resolution);
     MCP_SAVE(c, resume_scale);
+    MCP_SAVE(c, safety_min_speed);
     MCP_SAVE(c, block_timeout);
     return c;
 }
@@ -137,7 +161,124 @@ TrajectoryFollower::Parameters TrajectoryFollower::Parameters::FromYAML(
 // ---------------------------------------------------------------- trajectory
 void TrajectoryFollower::setTrajectory(const Trajectory& traj)
 {
-    traj_ = traj;
+    // Split the path at its pivots: runs of points within kMinKnotDist of
+    // each other along which the heading turns by kPivotMinAngle or more.
+    legs_.clear();
+    if (params.pivot_in_place && params.min_turn_radius <= 0)
+    {
+        Leg cur;
+        for (std::size_t i = 0; i < traj.size();)
+        {
+            std::size_t j      = i;
+            double      turned = 0;
+            while (j + 1 < traj.size() &&
+                   std::hypot(
+                       traj[j + 1].pose.x - traj[i].pose.x,
+                       traj[j + 1].pose.y - traj[i].pose.y) < kMinKnotDist)
+            {
+                turned += mrpt::math::wrapToPi(
+                    traj[j + 1].pose.phi - traj[j].pose.phi);
+                j++;
+            }
+            if (std::abs(turned) < kPivotMinAngle)
+            {
+                cur.path.insert(
+                    cur.path.end(), traj.begin() + i, traj.begin() + j + 1);
+            }
+            else
+            {
+                cur.path.push_back(traj[i]);
+                if (cur.path.size() >= 2 || cur.pivotTo)
+                {
+                    legs_.push_back(cur);
+                }
+                cur          = Leg();
+                cur.pivotTo  = mrpt::math::wrapToPi(traj[j].pose.phi);
+                cur.pivotDir = turned > 0 ? 1.0 : -1.0;
+                cur.path.push_back(traj[j]);
+            }
+            i = j + 1;
+        }
+        if (cur.path.size() >= 2 || cur.pivotTo) { legs_.push_back(cur); }
+    }
+    else if (!traj.empty()) { legs_.push_back({std::nullopt, 1.0, traj}); }
+
+    startLeg(0);
+
+    lastCommandedSpeed_ = 0;
+    lastCommandedOmega_ = 0;
+    lastCommandedCurv_  = 0;
+    stopped_            = false;
+    stoppedSince_       = INVALID_TIMESTAMP;
+    offPathSince_       = INVALID_TIMESTAMP;
+    speedCap_           = std::numeric_limits<double>::infinity();
+    ctrlPoseInit_       = false;
+    // (no commands were sent since a terminal status)
+    if (finalStatus_) { recentCmds_.clear(); }
+    finalStatus_.reset();
+}
+
+void TrajectoryFollower::startLeg(std::size_t idx)
+{
+    legIdx_   = idx;
+    pivoting_ = idx < legs_.size() && legs_[idx].pivotTo.has_value();
+    setLegPath(idx < legs_.size() ? legs_[idx].path : Trajectory());
+}
+
+void TrajectoryFollower::setLegPath(const Trajectory& traj)
+{
+    // Merge (nearly) duplicated consecutive points, keeping the final pose:
+    // a tiny segment between them could point anywhere and be taken for a
+    // spurious direction reversal (cusp).
+    traj_.clear();
+    for (std::size_t i = 0; i < traj.size(); i++)
+    {
+        const auto& p = traj[i];
+        if (!traj_.empty() &&
+            std::hypot(
+                p.pose.x - traj_.back().pose.x,
+                p.pose.y - traj_.back().pose.y) < kMinKnotDist)
+        {
+            if (i + 1 == traj.size() && traj_.size() > 1) { traj_.back() = p; }
+            continue;
+        }
+        traj_.push_back(p);
+    }
+
+    // Remove interior back-and-forth legs (between two cusps) of a few
+    // centimeters, as left by a planner where two edges join: stopping and
+    // reversing for that is pointless, and not feasible for a car-like
+    // vehicle. Real maneuvers have much longer legs.
+    constexpr double kMinLegLength = 0.05;  // [m]
+    const auto       isCusp        = [this](std::size_t i)
+    {
+        const auto& a = traj_[i - 1].pose;
+        const auto& b = traj_[i].pose;
+        const auto& c = traj_[i + 1].pose;
+        return (b.x - a.x) * (c.x - b.x) + (b.y - a.y) * (c.y - b.y) < 0.0;
+    };
+    for (std::size_t i = 1; i + 2 < traj_.size(); i++)
+    {
+        if (!isCusp(i)) { continue; }
+        // Next cusp within kMinLegLength?
+        double len = 0;
+        for (std::size_t j = i + 1; j + 1 < traj_.size(); j++)
+        {
+            const auto& a = traj_[j - 1].pose;
+            const auto& b = traj_[j].pose;
+            len += std::hypot(b.x - a.x, b.y - a.y);
+            if (len >= kMinLegLength) { break; }
+            if (isCusp(j))
+            {
+                // Remove both turnaround knots, joining the knots before
+                // and after them, and recheck that join:
+                traj_.erase(traj_.begin() + i, traj_.begin() + j + 1);
+                i = std::max<std::size_t>(i, 2) - 2;
+                break;
+            }
+        }
+    }
+
     cumS_.assign(traj_.size(), 0.0);
     for (std::size_t i = 1; i < traj_.size(); i++)
     {
@@ -145,17 +286,12 @@ void TrajectoryFollower::setTrajectory(const Trajectory& traj)
         const auto& b = traj_[i].pose;
         cumS_[i]      = cumS_[i - 1] + std::hypot(b.x - a.x, b.y - a.y);
     }
-    lastS_              = 0;
-    currentInterval_    = 0;
-    lastCommandedSpeed_ = 0;
-    lastCommandedOmega_ = 0;
-    lastCommandedCurv_  = 0;
-    stopped_            = false;
-    stoppedSince_       = INVALID_TIMESTAMP;
-    offPathSince_       = INVALID_TIMESTAMP;
-    arrived_            = false;
-    minDistToGoal_      = std::numeric_limits<double>::infinity();
-    ctrlPoseInit_       = false;
+    lastS_           = 0;
+    currentInterval_ = 0;
+    arrived_         = false;
+    overshotGoal_    = false;
+    rotatingAtGoal_  = false;
+    minDistToGoal_   = std::numeric_limits<double>::infinity();
 
     // Cusp arc-lengths: points where the path travel direction reverses (a
     // differential-drive planner backs up then drives forward, etc.). The
@@ -177,17 +313,120 @@ void TrajectoryFollower::setTrajectory(const Trajectory& traj)
         }
     }
 
+    // Signed curvature of the path tangent around each vertex: its turning
+    // angle, spread over half the distance to the neighbor vertices on each
+    // side (so that dense knots tile the path, e.g. a sampled arc reads as a
+    // constant curvature), at most kSpread (a sharp polyline corner reads as
+    // a short arc). Where the tangent before or after a vertex is unknown
+    // (path ends, cusps, where the travel direction reverses), the turn on
+    // that side is taken from the vertex pose heading, if consistent with
+    // the segment direction (e.g. the start of an arc).
+    {
+        constexpr double  kSpread     = 0.2;  // [m]
+        constexpr double  kMaxEndTurn = mrpt::DEG2RAD(45.0);
+        const std::size_t n           = traj_.size();
+        curvBefore_.assign(n, 0.0);
+        curvAfter_.assign(n, 0.0);
+        spanBefore_.assign(n, 0.0);
+        spanAfter_.assign(n, 0.0);
+        const auto tangent = [this](std::size_t i)  // segment i -> i+1
+        {
+            const auto& a = traj_[i].pose;
+            const auto& b = traj_[i + 1].pose;
+            return std::atan2(b.y - a.y, b.x - a.x);
+        };
+        // Turn from a pose heading to a segment tangent, in the travel
+        // direction (either forward or in reverse along the segment):
+        const auto headingTurn = [](double fromAngle, double toAngle)
+        {
+            double d = mrpt::math::wrapToPi(toAngle - fromAngle);
+            if (std::abs(d) > M_PI_2) { d = mrpt::math::wrapToPi(d - M_PI); }
+            return std::abs(d) <= kMaxEndTurn ? d : 0.0;
+        };
+        std::size_t cuspPos = 0;
+        for (std::size_t i = 0; i < n; i++)
+        {
+            const bool atCusp =
+                cuspPos < cuspIdx_.size() && cuspIdx_[cuspPos] == i;
+            if (atCusp) { cuspPos++; }
+            const bool hasPrev = i > 0;
+            const bool hasNext = i + 1 < n;
+            if (hasPrev)
+            {
+                spanBefore_[i] =
+                    std::min(kSpread, 0.5 * (cumS_[i] - cumS_[i - 1]));
+            }
+            if (hasNext)
+            {
+                spanAfter_[i] =
+                    std::min(kSpread, 0.5 * (cumS_[i + 1] - cumS_[i]));
+            }
+            if (hasPrev && hasNext && !atCusp)
+            {
+                const double turn =
+                    mrpt::math::wrapToPi(tangent(i) - tangent(i - 1));
+                const double span = spanBefore_[i] + spanAfter_[i];
+                if (span > 0) { curvBefore_[i] = curvAfter_[i] = turn / span; }
+                continue;
+            }
+            // A path end or a cusp: from the pose heading.
+            const double phi = traj_[i].pose.phi;
+            if (hasPrev && spanBefore_[i] > 0)
+            {
+                curvBefore_[i] =
+                    headingTurn(tangent(i - 1), phi) / spanBefore_[i];
+            }
+            if (hasNext && spanAfter_[i] > 0)
+            {
+                curvAfter_[i] = headingTurn(phi, tangent(i)) / spanAfter_[i];
+            }
+        }
+    }
+
+    // Path curvature at each knot: heading change over a window of ~0.4 m
+    // around it (robust to short, noisy segments), not crossing cusps:
+    knotCurv_.assign(traj_.size(), 0.0);
+    {
+        std::size_t intervalStart = 0;
+        std::size_t cuspPos       = 0;
+        for (std::size_t i = 0; i < traj_.size(); i++)
+        {
+            while (cuspPos < cuspIdx_.size() && cuspIdx_[cuspPos] <= i)
+            {
+                intervalStart = cuspIdx_[cuspPos];
+                cuspPos++;
+            }
+            const std::size_t intervalEnd = cuspPos < cuspIdx_.size()
+                                                ? cuspIdx_[cuspPos]
+                                                : traj_.size() - 1;
+            constexpr double  kWindow     = 0.4;  // [m]
+            std::size_t       j           = i;
+            std::size_t       k           = i;
+            while (cumS_[k] - cumS_[j] < kWindow &&
+                   (j > intervalStart || k < intervalEnd))
+            {
+                if (j > intervalStart) { j--; }
+                if (k < intervalEnd && cumS_[k] - cumS_[j] < kWindow) { k++; }
+            }
+            const double ds = cumS_[k] - cumS_[j];
+            if (ds > 0.05)
+            {
+                knotCurv_[i] = std::abs(mrpt::math::wrapToPi(
+                                   traj_[k].pose.phi - traj_[j].pose.phi)) /
+                               ds;
+            }
+        }
+    }
+
     // Driving gear per cusp-bounded interval, decided independently for each
     // interval's own end boundary (no dependency between intervals): reverse
     // when the vehicle's recorded heading approaching that boundary is
     // opposed to the boundary's own approach direction (e.g. a
     // differential-drive planner backs the robot in), forward when it
     // matches (an open-space approach the robot can drive nose-first).
-    // Measured over a <=0.7 m window so a jagged micro-tail does not decide
-    // it; the window is anchored at the boundary and reaches backward as far
-    // as needed (even past an earlier cusp) rather than being clipped to the
-    // interval's own extent, so a short interval still gets a robust
-    // decision instead of being dominated by its own noise.
+    // Measured over a <=0.7 m window anchored at the boundary, so a jagged
+    // micro-tail does not decide it, and clipped to the interval's own extent
+    // (see below).
     //
     // The heading compared against is the *previous* knot's, not the
     // boundary knot's own: at an intermediate cusp, comparing against the
@@ -207,17 +446,181 @@ void TrajectoryFollower::setTrajectory(const Trajectory& traj)
             const double      sEnd   = isLast ? totalLength() : cuspS_[k];
             const std::size_t endHIdx =
                 isLast ? traj_.size() - 1 : cuspIdx_[k] - 1;
-            const double endH  = traj_[endHIdx].pose.phi;
-            const double w     = std::min(sEnd, 0.7);
-            const auto   pB    = pointAtArc(sEnd);
-            const auto   pA    = pointAtArc(sEnd - w);
-            const double chord = std::hypot(pB.x - pA.x, pB.y - pA.y);
+            const double endH = traj_[endHIdx].pose.phi;
+            // The window must not reach into the previous interval: across a
+            // cusp, the chord to a short leg doubling back over the previous
+            // one would point the wrong way. Except for legs shorter than the
+            // min turning radius: micro-maneuvers a steering-limited vehicle
+            // cannot execute are judged together with the previous leg.
+            const double sBegin = k == 0 ? 0.0 : cuspS_[k - 1];
+            const double legLen = sEnd - sBegin;
+            const double w      = legLen >= params.min_turn_radius
+                                      ? std::min(legLen, 0.7)
+                                      : std::min(sEnd, 0.7);
+            const auto   pB     = pointAtArc(sEnd);
+            const auto   pA     = pointAtArc(sEnd - w);
+            const double chord  = std::hypot(pB.x - pA.x, pB.y - pA.y);
             const double tang =
                 chord > 1e-3 ? std::atan2(pB.y - pA.y, pB.x - pA.x) : endH;
             gearPerInterval_[k] =
                 std::cos(mrpt::math::wrapToPi(endH - tang)) >= 0.0 ? 1.0 : -1.0;
         }
     }
+}
+
+void TrajectoryFollower::updateTrajectory(const Trajectory& traj)
+{
+    // A completed trajectory is not continued: the robot may have been moved
+    // since then.
+    if (!hasTrajectory() || traj.size() < 2 || finalStatus_)
+    {
+        setTrajectory(traj);
+        return;
+    }
+
+    // Progress: the current pivot, or the progress point on the current path
+    const bool wasPivoting = pivoting_ || traj_.size() < 2;
+    const auto oldLeg      = legs_.at(legIdx_);
+    const auto progressPt  = wasPivoting ? mrpt::math::TPoint2D(
+                                               oldLeg.path.front().pose.x,
+                                               oldLeg.path.front().pose.y)
+                                         : pointAtArc(lastS_);
+
+    // Motion state to keep:
+    const auto speed    = lastCommandedSpeed_;
+    const auto omega    = lastCommandedOmega_;
+    const auto curv     = lastCommandedCurv_;
+    const auto ctrlPose = ctrlPose_;
+    const auto lastOdom = lastOdom_;
+    const auto ctrlInit = ctrlPoseInit_;
+
+    // Safety-stop state: a path update must not restart the stop timers or the
+    // resume hysteresis:
+    const auto stopped      = stopped_;
+    const auto stoppedSince = stoppedSince_;
+    const auto offPathSince = offPathSince_;
+    const auto speedCap     = speedCap_;
+
+    // Direction of the old path at the progress point, to tell apart legs of
+    // the new path that pass over the same point (e.g. before and after a
+    // cusp):
+    mrpt::math::TPoint2D progressDir(0, 0);
+    for (std::size_t i = 0; !wasPivoting && i + 1 < traj_.size(); i++)
+    {
+        if (cumS_[i + 1] >= lastS_ && cumS_[i + 1] > cumS_[i])
+        {
+            progressDir = {
+                traj_[i + 1].pose.x - traj_[i].pose.x,
+                traj_[i + 1].pose.y - traj_[i].pose.y};
+            break;
+        }
+    }
+
+    setTrajectory(traj);
+    if (!hasTrajectory()) { return; }  // not trackable: keep the reset state
+
+    lastCommandedSpeed_ = speed;
+    lastCommandedOmega_ = omega;
+    lastCommandedCurv_  = curv;
+    ctrlPose_           = ctrlPose;
+    lastOdom_           = lastOdom;
+    ctrlPoseInit_       = ctrlInit;
+    stopped_            = stopped;
+    stoppedSince_       = stoppedSince;
+    offPathSince_       = offPathSince;
+    speedCap_           = speedCap;
+
+    constexpr double kMatchTol = 0.02;  // [m]
+
+    // Rotating at a pivot: go on with the same pivot of the new path, if any.
+    if (wasPivoting && oldLeg.pivotTo)
+    {
+        for (std::size_t k = 0; k < legs_.size(); k++)
+        {
+            const auto& leg = legs_[k];
+            if (leg.pivotTo &&
+                std::hypot(
+                    leg.path.front().pose.x - progressPt.x,
+                    leg.path.front().pose.y - progressPt.y) < kMatchTol &&
+                std::abs(mrpt::math::angDistance(
+                    *leg.pivotTo, *oldLeg.pivotTo)) < kPivotMinAngle)
+            {
+                startLeg(k);
+                return;
+            }
+        }
+    }
+
+    // Progress: the first point of the new path matching the old progress
+    // point on a segment in the same direction (the shared part of both paths
+    // is identical), or else the point nearest to the control pose:
+    const auto nearestS = [this](
+                              const mrpt::math::TPoint2D& q, double tol,
+                              const std::optional<mrpt::math::TPoint2D>& dir)
+    {
+        std::optional<double> best;
+        double                bestD2 = tol * tol;
+        for (std::size_t i = 0; i + 1 < traj_.size(); i++)
+        {
+            const auto&  a    = traj_[i].pose;
+            const auto&  b    = traj_[i + 1].pose;
+            const double sx   = b.x - a.x;
+            const double sy   = b.y - a.y;
+            const double len2 = sx * sx + sy * sy;
+            if (len2 < 1e-9) { continue; }
+            if (dir && sx * dir->x + sy * dir->y <= 0) { continue; }
+            const double t = std::clamp(
+                ((q.x - a.x) * sx + (q.y - a.y) * sy) / len2, 0.0, 1.0);
+            const double dx = q.x - (a.x + t * sx);
+            const double dy = q.y - (a.y + t * sy);
+            const double d2 = dx * dx + dy * dy;
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                best   = cumS_[i] + t * std::sqrt(len2);
+                if (std::isfinite(tol)) { break; }  // first match
+            }
+        }
+        return best;
+    };
+    const std::optional<mrpt::math::TPoint2D> dirOpt =
+        wasPivoting ? std::nullopt
+                    : std::optional<mrpt::math::TPoint2D>(progressDir);
+    for (std::size_t k = 0; k < legs_.size(); k++)
+    {
+        startLeg(k);
+        if (const auto newS = nearestS(progressPt, kMatchTol, dirOpt); newS)
+        {
+            // (Past its pivot, if any, unless at its very start)
+            pivoting_ = pivoting_ && *newS <= kMatchTol;
+            lastS_    = *newS;
+            advanceGear(lastS_);
+            return;
+        }
+    }
+    const auto  p = ctrlPoseInit_ ? ctrlPose_.asTPose() : traj.front().pose;
+    std::size_t bestLeg  = 0;
+    double      bestS    = 0;
+    double      bestDist = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 0; k < legs_.size(); k++)
+    {
+        startLeg(k);
+        const auto newS = nearestS(
+            {p.x, p.y}, std::numeric_limits<double>::infinity(), std::nullopt);
+        if (!newS) { continue; }
+        const auto   q = pointAtArc(*newS);
+        const double d = std::hypot(q.x - p.x, q.y - p.y);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestLeg  = k;
+            bestS    = *newS;
+        }
+    }
+    startLeg(bestLeg);
+    pivoting_ = pivoting_ && bestS <= kMatchTol;
+    lastS_    = bestS;
+    advanceGear(lastS_);
 }
 
 double TrajectoryFollower::advanceGear(double s)
@@ -247,6 +650,9 @@ double TrajectoryFollower::advanceGear(double s)
 
 void TrajectoryFollower::reset()
 {
+    legs_.clear();
+    legIdx_   = 0;
+    pivoting_ = false;
     traj_.clear();
     cumS_.clear();
     cuspS_.clear();
@@ -260,9 +666,14 @@ void TrajectoryFollower::reset()
     stopped_            = false;
     stoppedSince_       = INVALID_TIMESTAMP;
     offPathSince_       = INVALID_TIMESTAMP;
+    speedCap_           = std::numeric_limits<double>::infinity();
     arrived_            = false;
+    overshotGoal_       = false;
+    rotatingAtGoal_     = false;
     minDistToGoal_      = std::numeric_limits<double>::infinity();
     ctrlPoseInit_       = false;
+    finalStatus_.reset();
+    recentCmds_.clear();
 }
 
 void TrajectoryFollower::setRobotShape(const RobotShape& shape)
@@ -291,8 +702,24 @@ TrajectoryFollower::Projection TrajectoryFollower::projectToPath(
     Projection best;
     double     bestD2 = std::numeric_limits<double>::infinity();
 
-    const double backWindow = 0.5;
-    const double fwdWindow  = std::max(3.0, 2.0 * params.lookahead_max);
+    double fwdEnd    = sHint + std::max(3.0, 2.0 * params.lookahead_max);
+    double backBegin = sHint - 0.5;
+
+    // Nor before the last cusp already passed: the leg after a cusp often
+    // runs back close to the one before it.
+    if (currentInterval_ > 0 && currentInterval_ <= cuspS_.size())
+    {
+        backBegin = std::max(backBegin, cuspS_[currentInterval_ - 1]);
+    }
+
+    // A cusp is a stop the vehicle must actually reach: do not match the path
+    // beyond it until then (the projection gets there when the vehicle passes
+    // the cusp). Otherwise, where the next leg runs back close to the current
+    // one, the projection skips the rest of this leg.
+    if (currentInterval_ < cuspS_.size())
+    {
+        fwdEnd = std::min(fwdEnd, cuspS_[currentInterval_]);
+    }
 
     // Two passes: a local window around sHint (keeps progress monotone on paths
     // that re-approach themselves), then a full search if nothing matched.
@@ -301,8 +728,7 @@ TrajectoryFollower::Projection TrajectoryFollower::projectToPath(
         const bool windowed = (pass == 0);
         for (std::size_t i = 0; i + 1 < traj_.size(); i++)
         {
-            if (windowed && (cumS_[i + 1] < sHint - backWindow ||
-                             cumS_[i] > sHint + fwdWindow))
+            if (windowed && (cumS_[i + 1] <= backBegin || cumS_[i] >= fwdEnd))
                 continue;
 
             const auto&  a    = traj_[i].pose;
@@ -332,47 +758,110 @@ TrajectoryFollower::Projection TrajectoryFollower::projectToPath(
     return best;
 }
 
+namespace
+{
+// Index i of the segment [i, i+1] containing arc-length `s` (cumS is sorted).
+std::size_t segmentAt(const std::vector<double>& cumS, double s)
+{
+    const auto it = std::lower_bound(cumS.begin() + 1, cumS.end(), s);
+    const auto j  = static_cast<std::size_t>(it - cumS.begin());
+    return std::min(j - 1, cumS.size() - 2);
+}
+}  // namespace
+
 mrpt::math::TPoint2D TrajectoryFollower::pointAtArc(double s) const
 {
     if (traj_.empty()) return {0, 0};
-    s = std::clamp(s, 0.0, totalLength());
-    // find segment [i, i+1] containing s
-    std::size_t i = 0;
-    while (i + 2 < traj_.size() && cumS_[i + 1] < s) i++;
-    const auto&  a      = traj_[i].pose;
-    const auto&  b      = traj_[i + 1].pose;
-    const double segLen = cumS_[i + 1] - cumS_[i];
-    const double t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
+    s                        = std::clamp(s, 0.0, totalLength());
+    const std::size_t i      = segmentAt(cumS_, s);
+    const auto&       a      = traj_[i].pose;
+    const auto&       b      = traj_[i + 1].pose;
+    const double      segLen = cumS_[i + 1] - cumS_[i];
+    const double      t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
     return {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)};
 }
 
 mrpt::math::TPose2D TrajectoryFollower::poseAtArc(double s) const
 {
     if (traj_.empty()) return {0, 0, 0};
-    s             = std::clamp(s, 0.0, totalLength());
-    std::size_t i = 0;
-    while (i + 2 < traj_.size() && cumS_[i + 1] < s) i++;
-    const auto&  a       = traj_[i].pose;
-    const auto&  b       = traj_[i + 1].pose;
-    const double segLen  = cumS_[i + 1] - cumS_[i];
-    const double t       = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
-    const double heading = std::atan2(b.y - a.y, b.x - a.x);
-    return {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y), heading};
+    s                        = std::clamp(s, 0.0, totalLength());
+    const std::size_t i      = segmentAt(cumS_, s);
+    const auto&       a      = traj_[i].pose;
+    const auto&       b      = traj_[i + 1].pose;
+    const double      segLen = cumS_[i + 1] - cumS_[i];
+    const double      t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
+    // The tangent of the path with the curvature of refCurvatureAt(): the
+    // segment direction at its middle, turning near its ends (e.g. along a
+    // sampled arc, the tangent of the arc, not of the chord):
+    double heading = std::atan2(b.y - a.y, b.x - a.x);
+    if (i < spanAfter_.size() && i + 1 < spanBefore_.size())
+    {
+        const double fromStart = s - cumS_[i];
+        const double toEnd     = cumS_[i + 1] - s;
+        if (fromStart < 0.5 * segLen)
+        {
+            heading -= curvAfter_[i] * std::max(0.0, spanAfter_[i] - fromStart);
+        }
+        else
+        {
+            heading +=
+                curvBefore_[i + 1] * std::max(0.0, spanBefore_[i + 1] - toEnd);
+        }
+    }
+    return {
+        a.x + t * (b.x - a.x), a.y + t * (b.y - a.y),
+        mrpt::math::wrapToPi(heading)};
+}
+
+mrpt::math::TPose2D TrajectoryFollower::bodyPoseAtArc(double s) const
+{
+    if (traj_.empty()) return {0, 0, 0};
+    s                        = std::clamp(s, 0.0, totalLength());
+    const std::size_t i      = segmentAt(cumS_, s);
+    const auto&       a      = traj_[i].pose;
+    const auto&       b      = traj_[i + 1].pose;
+    const double      segLen = cumS_[i + 1] - cumS_[i];
+    const double      t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
+    const double      phi    = a.phi + t * mrpt::math::wrapToPi(b.phi - a.phi);
+    return {
+        a.x + t * (b.x - a.x), a.y + t * (b.y - a.y),
+        mrpt::math::wrapToPi(phi)};
 }
 
 double TrajectoryFollower::speedCapAt(double s) const
 {
     if (traj_.empty()) return params.max_speed;
-    s             = std::clamp(s, 0.0, totalLength());
-    std::size_t i = 0;
-    while (i + 2 < traj_.size() && cumS_[i + 1] < s) i++;
-    const double segLen = cumS_[i + 1] - cumS_[i];
-    const double t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
+    s                        = std::clamp(s, 0.0, totalLength());
+    const std::size_t i      = segmentAt(cumS_, s);
+    const double      segLen = cumS_[i + 1] - cumS_[i];
+    const double      t      = segLen > 1e-9 ? (s - cumS_[i]) / segLen : 0.0;
     auto         eff = [&](double v) { return v <= 0 ? params.max_speed : v; };
     const double v0  = eff(traj_[i].target_speed);
     const double v1  = eff(traj_[i + 1].target_speed);
     const double cap = v0 + t * (v1 - v0);
     return std::min(cap, params.max_speed);
+}
+
+double TrajectoryFollower::refCurvatureAt(double s, double gear) const
+{
+    if (traj_.size() < 2) { return 0.0; }
+
+    // The segment [i, i+1] holding `s`; its curvature comes from the vertices
+    // at both ends (see setLegPath()):
+    const auto  it = std::upper_bound(cumS_.begin(), cumS_.end(), s);
+    std::size_t i =
+        static_cast<std::size_t>(std::max<std::ptrdiff_t>(
+            1, std::min<std::ptrdiff_t>(
+                   it - cumS_.begin(),
+                   static_cast<std::ptrdiff_t>(traj_.size()) - 1))) -
+        1;
+    double curv = 0;
+    if (s - cumS_[i] <= spanAfter_[i]) { curv += curvAfter_[i]; }
+    if (cumS_[i + 1] - s < spanBefore_[i + 1]) { curv += curvBefore_[i + 1]; }
+
+    // The tangent is the travel direction: in reverse, the same turn is a
+    // curvature of opposite sign.
+    return gear * curv;
 }
 
 double TrajectoryFollower::adaptiveLookaheadS(double sStart, double capS) const
@@ -422,32 +911,16 @@ double TrajectoryFollower::adaptiveLookaheadS(double sStart, double capS) const
 }
 
 // ------------------------------------------------------------------- pursuit
-TrajectoryFollower::Command TrajectoryFollower::pursuit(
-    const mrpt::math::TPose2D& fromPose, double currentV, double currentOmega,
-    double currentCurv, double sHint, double dt, double gear,
-    double speedScale) const
+// Pure-pursuit curvature from `fromPose`, whose projection on the path is at
+// arc-length `sStart`, with the lookahead bounded by `capS`.
+double TrajectoryFollower::pursuitCurvature(
+    const mrpt::math::TPose2D& fromPose, double sStart, double capS,
+    mrpt::math::TPoint2D& lookahead, double& lookaheadS, double& Ld,
+    double& yr) const
 {
-    Command          out;
-    const Projection proj = projectToPath({fromPose.x, fromPose.y}, sHint);
-
-    // Do not look past the next cusp: on a path that doubles back, a lookahead
-    // reaching into the reversed branch yields a huge spurious curvature (the
-    // robot tries to spin toward a point it should reach by reversing gear, not
-    // by turning). Clamp the lookahead arc-length to the next direction change.
-    // Bounded via currentInterval_ (the same latch `gear` was already read
-    // from), not by re-scanning cuspS_ against `proj.s`: projectToPath's
-    // windowed search can legitimately let `proj.s` drift back below a cusp
-    // the vehicle has already committed past (its own nearest-point search
-    // window, not a progress guarantee), which would otherwise re-clamp the
-    // lookahead onto a cusp already behind the vehicle and pin it there.
-    const double nextCuspS = currentInterval_ < cuspS_.size()
-                                 ? cuspS_[currentInterval_]
-                                 : std::numeric_limits<double>::infinity();
-    // Curvature-adaptive lookahead within the [proj.s, cap] arc-length window,
-    // where the cap is the shorter of the max travel and the next cusp.
-    const double capS = std::min(proj.s + params.lookahead_max, nextCuspS);
-    double       lookaheadS = adaptiveLookaheadS(proj.s, capS);
-    out.lookahead           = pointAtArc(lookaheadS);
+    // Curvature-adaptive lookahead within the [sStart, capS] window:
+    lookaheadS = adaptiveLookaheadS(sStart, capS);
+    lookahead  = pointAtArc(lookaheadS);
 
     // Lookahead in robot frame.
     const double c            = std::cos(fromPose.phi);
@@ -458,8 +931,8 @@ TrajectoryFollower::Command TrajectoryFollower::pursuit(
         const double dy = p.y - fromPose.y;
         return mrpt::math::TPoint2D(c * dx + sn * dy, -sn * dx + c * dy);
     };
-    mrpt::math::TPoint2D lr = toRobotFrame(out.lookahead);
-    double               Ld = lr.norm();
+    mrpt::math::TPoint2D lr = toRobotFrame(lookahead);
+    Ld                      = lr.norm();
 
     // Euclidean lookahead floor (enforced everywhere along the path, not
     // only at the goal). The pure-pursuit correction gain scales as ~2/Ld^2,
@@ -481,10 +954,10 @@ TrajectoryFollower::Command TrajectoryFollower::pursuit(
             std::max(params.min_lookahead_dist, params.min_turn_radius);
         while (Ld < minLd && lookaheadS + 1e-6 < capS)
         {
-            lookaheadS    = std::min(capS, lookaheadS + 0.1);
-            out.lookahead = pointAtArc(lookaheadS);
-            lr            = toRobotFrame(out.lookahead);
-            Ld            = lr.norm();
+            lookaheadS = std::min(capS, lookaheadS + 0.1);
+            lookahead  = pointAtArc(lookaheadS);
+            lr         = toRobotFrame(lookahead);
+            Ld         = lr.norm();
         }
         if (Ld < minLd)
         {
@@ -494,8 +967,8 @@ TrajectoryFollower::Command TrajectoryFollower::pursuit(
             constexpr double           kEndWindow = 0.5;  // [m]
             const double               w          = std::min(sPin, kEndWindow);
             const mrpt::math::TPoint2D pEndA      = pointAtArc(sPin - w);
-            double                     ex         = out.lookahead.x - pEndA.x;
-            double                     ey         = out.lookahead.y - pEndA.y;
+            double                     ex         = lookahead.x - pEndA.x;
+            double                     ey         = lookahead.y - pEndA.y;
             const double               eLen       = std::hypot(ex, ey);
             if (eLen > 1e-6)
             {
@@ -521,22 +994,76 @@ TrajectoryFollower::Command TrajectoryFollower::pursuit(
             // unit length) and take the positive root (there is exactly one,
             // since |e| = Ld < minLd means the pin is already inside the
             // target circle).
-            const double ex0  = out.lookahead.x - fromPose.x;
-            const double ey0  = out.lookahead.y - fromPose.y;
+            const double ex0  = lookahead.x - fromPose.x;
+            const double ey0  = lookahead.y - fromPose.y;
             const double b    = ex0 * ex + ey0 * ey;  // e . dir
             const double disc = b * b + (minLd * minLd - Ld * Ld);
             const double t    = -b + std::sqrt(std::max(0.0, disc));
-            out.lookahead.x += t * ex;
-            out.lookahead.y += t * ey;
-            lr = toRobotFrame(out.lookahead);
+            lookahead.x += t * ex;
+            lookahead.y += t * ey;
+            lr = toRobotFrame(lookahead);
             Ld = lr.norm();
         }
     }
-    const double yr = lr.y;
+    yr = lr.y;
+    return Ld > 1e-3 ? 2.0 * yr / (Ld * Ld) : 0.0;
+}
 
+TrajectoryFollower::Command TrajectoryFollower::pursuit(
+    const mrpt::math::TPose2D& fromPose, double currentV, double currentOmega,
+    double currentCurv, double sHint, double dt, double gear,
+    double speedScale) const
+{
+    Command          out;
+    const Projection proj = projectToPath({fromPose.x, fromPose.y}, sHint);
+
+    // Do not look past the next cusp: on a path that doubles back, a lookahead
+    // reaching into the reversed branch yields a huge spurious curvature (the
+    // robot tries to spin toward a point it should reach by reversing gear, not
+    // by turning). Clamp the lookahead arc-length to the next direction change.
+    // Bounded via currentInterval_ (the same latch `gear` was already read
+    // from), not by re-scanning cuspS_ against `proj.s`: projectToPath's
+    // windowed search can legitimately let `proj.s` drift back below a cusp
+    // the vehicle has already committed past (its own nearest-point search
+    // window, not a progress guarantee), which would otherwise re-clamp the
+    // lookahead onto a cusp already behind the vehicle and pin it there.
+    const double nextCuspS = currentInterval_ < cuspS_.size()
+                                 ? cuspS_[currentInterval_]
+                                 : std::numeric_limits<double>::infinity();
+    // Curvature-adaptive lookahead within the [proj.s, cap] arc-length window,
+    // where the cap is the shorter of the max travel and the next cusp.
+    const double capS = std::min(proj.s + params.lookahead_max, nextCuspS);
+    double       Ld   = 0;
+    double       yr   = 0;
     // Pure-pursuit curvature; the same circle is driven forward or in reverse,
     // the sign of the commanded speed (via `gear`) sets the travel direction.
-    double curv = Ld > 1e-3 ? 2.0 * yr / (Ld * Ld) : 0.0;
+    double lookaheadS = 0;
+    double curv       = pursuitCurvature(
+              fromPose, proj.s, capS, out.lookahead, lookaheadS, Ld, yr);
+
+    // Curvature feedforward: pure pursuit alone starts turning as soon as its
+    // lookahead point enters a curve, cutting it (and the same happens on the
+    // way out). Instead, follow the reference curvature at the vehicle, and
+    // use pure pursuit only for the feedback: its curvature minus the one it
+    // would command from the reference pose itself (zero when on the path).
+    // Unless the lookahead is pinned to the next stop (goal or cusp) with no
+    // minimum lookahead distance: it then collapses onto that point, where
+    // the difference of two pursuit curvatures is ill-conditioned.
+    const double nextStopS = std::min(nextCuspS, totalLength());
+    const bool   collapsing =
+        params.min_lookahead_dist <= 0 && lookaheadS >= nextStopS - 1e-3;
+    if (params.curvature_feedforward && !collapsing)
+    {
+        mrpt::math::TPose2D onPath = poseAtArc(proj.s);
+        if (gear < 0) { onPath.phi = mrpt::math::wrapToPi(onPath.phi + M_PI); }
+        mrpt::math::TPoint2D unusedLookahead;
+        double               unusedS    = 0;
+        double               unusedLd   = 0;
+        double               unusedYr   = 0;
+        const double         curvOnPath = pursuitCurvature(
+                    onPath, proj.s, capS, unusedLookahead, unusedS, unusedLd, unusedYr);
+        curv += refCurvatureAt(proj.s, gear) - curvOnPath;
+    }
     // Desired (unclamped) curvature, kept for the lateral-accel speed cap
     // below: when the turn the pursuit geometry actually wants is tighter
     // than the vehicle can make, clamping curv down (next) still leaves the
@@ -594,11 +1121,24 @@ TrajectoryFollower::Command TrajectoryFollower::pursuit(
     if (std::abs(curvDesired) > 1e-3)
         cap = std::min(
             cap, std::sqrt(params.max_lateral_accel / std::abs(curvDesired)));
+    // Angular speed limit, enforced through the linear speed so that the
+    // commanded curvature (the path geometry) is kept:
+    if (params.max_omega > 0.0 && std::abs(curv) > 1e-6)
+    {
+        cap = std::min(cap, params.max_omega / std::abs(curv));
+    }
+    // A lagging platform keeps moving ~|v|*lag after a stop command:
+    distToStop =
+        std::max(0.0, distToStop - std::abs(currentV) * params.actuation_lag);
     cap = std::min(cap, std::sqrt(2.0 * params.max_decel * distToStop));
+    if (params.curvature_preview)
+    {
+        cap = std::min(cap, curvaturePreviewCap(proj.s, nextCuspS));
+    }
 
-    // Predictive-safety speed scale (caps the target before rate-limiting so
-    // decel stays bounded by max_decel).
-    cap *= std::clamp(speedScale, 0.0, 1.0);
+    // Predictive-safety speed scale, and the external speed cap (caps the
+    // target before rate-limiting so decel stays bounded by max_decel).
+    cap = std::min(cap * std::clamp(speedScale, 0.0, 1.0), speedCap_);
 
     // Rate-limit the *signed* speed toward the gear-directed target. `sCur` is
     // the current speed measured in the gear's forward sense; if it is negative
@@ -684,7 +1224,7 @@ double TrajectoryFollower::footprintClearance(
 
 double TrajectoryFollower::forecastContactDistance(
     const mrpt::math::TPose2D& startPose, double startV, double startOmega,
-    double startCurv, double startS, double gear) const
+    double startCurv, double startS, double gear, double contactClearance) const
 {
     double              L  = 0;
     mrpt::math::TPose2D p  = startPose;
@@ -699,7 +1239,7 @@ double TrajectoryFollower::forecastContactDistance(
 
     for (int k = 0; k <= nSteps; k++)
     {
-        if (footprintClearance(p) <= params.safety_margin) return L;
+        if (footprintClearance(p) <= contactClearance) return L;
 
         const Command cmd =
             pursuit(p, v, om, cv, s, params.sample_period, gear, 1.0);
@@ -718,16 +1258,40 @@ double TrajectoryFollower::forecastContactDistance(
     return std::numeric_limits<double>::infinity();
 }
 
-double TrajectoryFollower::referenceContactDistance(double startS) const
+double TrajectoryFollower::referenceContactDistance(
+    double startS, double maxDist, double contactClearance) const
 {
     const double step = std::max(0.02, params.footprint_sample_resolution);
-    for (double ds = 0; ds <= params.reference_lookahead_dist; ds += step)
+    for (double ds = 0; ds <= maxDist; ds += step)
     {
         const double s = startS + ds;
         if (s > totalLength()) break;
-        if (footprintClearance(poseAtArc(s)) <= params.safety_margin) return ds;
+        if (footprintClearance(bodyPoseAtArc(s)) <= contactClearance)
+        {
+            return ds;
+        }
     }
     return std::numeric_limits<double>::infinity();
+}
+
+double TrajectoryFollower::curvaturePreviewCap(double s, double sMax) const
+{
+    const double a     = std::max(1e-3, params.max_decel);
+    const double reach = params.max_speed * params.max_speed / (2 * a) + 0.5;
+    const double sEnd  = std::min({s + reach, sMax, totalLength()});
+    double       cap   = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 0; k < traj_.size() && cumS_[k] <= sEnd; k++)
+    {
+        if (cumS_[k] <= s || knotCurv_[k] < 1e-3) { continue; }
+        double vCurve = std::sqrt(params.max_lateral_accel / knotCurv_[k]);
+        if (params.max_omega > 0)
+        {
+            vCurve = std::min(vCurve, params.max_omega / knotCurv_[k]);
+        }
+        cap =
+            std::min(cap, std::sqrt(vCurve * vCurve + 2 * a * (cumS_[k] - s)));
+    }
+    return cap;
 }
 
 double TrajectoryFollower::contactDistanceToScale(double d) const
@@ -735,12 +1299,80 @@ double TrajectoryFollower::contactDistanceToScale(double d) const
     if (!std::isfinite(d)) return 1.0;
     const double span =
         std::max(1e-3, params.slow_distance - params.stop_distance);
-    return std::clamp((d - params.stop_distance) / span, 0.0, 1.0);
+    const double linearScale =
+        std::clamp((d - params.stop_distance) / span, 0.0, 1.0);
+
+    // Never faster than the speed from which the vehicle can still brake
+    // before getting within stop_distance of the contact:
+    const double vBrake = std::sqrt(
+        2.0 * params.max_decel * std::max(0.0, d - params.stop_distance));
+    const double brakeScale = vBrake / std::max(1e-3, params.max_speed);
+
+    return std::min(linearScale, brakeScale);
 }
 
 // --------------------------------------------------------------- control pose
-mrpt::math::TPose2D TrajectoryFollower::controlPose(
+std::optional<mrpt::math::TPose2D> TrajectoryFollower::compensateLatency(
     const VehicleLocalizationState& loc, const VehicleOdometryState& odo)
+{
+    if (!odo.valid || odo.timestamp == INVALID_TIMESTAMP) { return loc.pose; }
+
+    // Keep a few seconds of odometry, in time order:
+    constexpr double kHistoryLength = 5.0;  // [s]
+    if (!odoHistory_.empty() && odo.timestamp < odoHistory_.back().first)
+    {
+        odoHistory_.clear();  // clock jump (e.g. simulation restarted)
+    }
+    if (odoHistory_.empty() || odo.timestamp > odoHistory_.back().first)
+    {
+        odoHistory_.emplace_back(
+            odo.timestamp, mrpt::poses::CPose2D(odo.odometry));
+    }
+    while (odoHistory_.size() > 2 &&
+           mrpt::system::timeDifference(
+               odoHistory_.front().first, odo.timestamp) > kHistoryLength)
+    {
+        odoHistory_.pop_front();
+    }
+
+    if (loc.timestamp == INVALID_TIMESTAMP) { return loc.pose; }
+    if (loc.timestamp < odoHistory_.front().first)
+    {
+        return std::nullopt;  // too old to bring it to the present
+    }
+    if (loc.timestamp >= odoHistory_.back().first)
+    {
+        return loc.pose;  // not older than the odometry: nothing to compensate
+    }
+
+    // Odometry pose at the localization timestamp, interpolated:
+    auto it = std::lower_bound(
+        odoHistory_.begin(), odoHistory_.end(), loc.timestamp,
+        [](const auto& e, const mrpt::system::TTimeStamp& t)
+        { return e.first < t; });
+    mrpt::poses::CPose2D odoAtLoc = it->second;
+    if (it != odoHistory_.begin())
+    {
+        const auto&  prev = *std::prev(it);
+        const double span = mrpt::system::timeDifference(prev.first, it->first);
+        const double f =
+            span > 0
+                ? mrpt::system::timeDifference(prev.first, loc.timestamp) / span
+                : 1.0;
+        const auto d = (it->second - prev.second).asTPose();
+        odoAtLoc =
+            prev.second + mrpt::poses::CPose2D(d.x * f, d.y * f, d.phi * f);
+    }
+
+    // Add the motion since then:
+    const auto locNow = mrpt::poses::CPose2D(loc.pose) +
+                        (mrpt::poses::CPose2D(odo.odometry) - odoAtLoc);
+    return locNow.asTPose();
+}
+
+mrpt::math::TPose2D TrajectoryFollower::controlPose(
+    const VehicleLocalizationState& loc, const VehicleOdometryState& odo,
+    bool correct)
 {
     // No odometry to propagate: track the raw localization directly.
     if (!odo.valid)
@@ -793,6 +1425,7 @@ mrpt::math::TPose2D TrajectoryFollower::controlPose(
     // to where the odom origin is).
     ctrlPose_ = ctrlPose_ + (odoP - lastOdom_);
     lastOdom_ = odoP;
+    if (!correct) { return ctrlPose_.asTPose(); }
 
     // Correction residual toward the raw localization, in the control pose's
     // own (vehicle) frame.
@@ -856,6 +1489,27 @@ mrpt::math::TPose2D TrajectoryFollower::controlPose(
 TrajectoryFollower::Output TrajectoryFollower::step(
     const VehicleLocalizationState& loc, const VehicleOdometryState& odo)
 {
+    // A completed trajectory is never resumed: the caller typically hands the
+    // vehicle to another controller (or a human) on these statuses, and an
+    // unlatched follower would fight it to get back onto the stale path.
+    if (hasTrajectory() && finalStatus_)
+    {
+        Output out;
+        out.status = *finalStatus_;
+        return out;
+    }
+    Output out = stepImpl(loc, odo);
+    if (out.status == FollowerStatus::ReachedGoal ||
+        out.status == FollowerStatus::MissedGoal)
+    {
+        finalStatus_ = out.status;
+    }
+    return out;
+}
+
+TrajectoryFollower::Output TrajectoryFollower::stepImpl(
+    const VehicleLocalizationState& loc, const VehicleOdometryState& odo)
+{
     Output out;
     if (!hasTrajectory())
     {
@@ -867,7 +1521,53 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     // high-rate wheel odometry (the map-frame localization only anchors the
     // path, see controlPose). With an identity/static map->odom (e.g. the unit
     // tests) this equals loc.pose exactly.
-    const mrpt::math::TPose2D ctrlPose = controlPose(loc, odo);
+    // The localization is first brought to the present: it is typically
+    // delivered with a latency (processing time), and tracking a past pose
+    // makes the vehicle lag behind and overshoot its goal.
+    // One too old for that is not used (better dead-reckoning on odometry).
+    const auto               locComp = compensateLatency(loc, odo);
+    VehicleLocalizationState locNow  = loc;
+    if (locComp) { locNow.pose = *locComp; }
+    mrpt::math::TPose2D ctrlPose =
+        controlPose(locNow, odo, locComp.has_value());
+
+    // Predict past the control dead time, with the commands sent meanwhile
+    // (they have not had an effect on the given pose yet):
+    const auto nDelay = static_cast<std::size_t>(
+        std::lround(params.control_delay / params.control_period));
+    while (recentCmds_.size() > nDelay) { recentCmds_.pop_front(); }
+    for (const auto& [v, w] : recentCmds_)
+    {
+        ctrlPose = integrateUnicycle(ctrlPose, v, w, params.control_period);
+    }
+    // This cycle's command, unless one is computed below:
+    if (nDelay > 0) { recentCmds_.emplace_back(0.0, 0.0); }
+
+    // Timers run on the odometry clock, which keeps advancing at a high rate
+    // even if the localization updates slowly or stalls:
+    const auto nowStamp =
+        odo.valid && odo.timestamp != INVALID_TIMESTAMP ? odo.timestamp
+        : loc.timestamp != INVALID_TIMESTAMP            ? loc.timestamp
+                                                        : mrpt::Clock::now();
+
+    // Rotation in place at the start of this leg (see pivot_in_place):
+    if (pivoting_)
+    {
+        if (auto o = pivotStep(ctrlPose, loc, odo, nowStamp); o) { return *o; }
+        if (traj_.size() < 2)
+        {
+            // A pivot at the end of the path:
+            arrived_            = true;
+            lastCommandedSpeed_ = 0;
+            out.status          = FollowerStatus::ReachedGoal;
+            return out;  // empty command => node stops
+        }
+    }
+    if (traj_.size() < 2)
+    {
+        out.status = FollowerStatus::ReachedGoal;  // (pivot already done)
+        return out;
+    }
 
     const Projection proj = projectToPath({ctrlPose.x, ctrlPose.y}, lastS_);
     lastS_                = proj.s;
@@ -904,20 +1604,34 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     const double               distToGoal =
         std::hypot(goalPt.x - ctrlPose.x, goalPt.y - ctrlPose.y);
     const bool nearPathEnd = totalLength() - proj.s <= params.arrival_radius;
-    if (nearPathEnd && distToGoal <= params.goal_dist_tol &&
-        std::abs(out.heading_err) <= params.goal_ang_tol)
+    // Within tolerance, but still finishing the deceleration onto the goal
+    // point (stopping right at the tolerance edge would leave that error).
+    // Passing it to one side instead is caught by the latch below. Without a
+    // minimum lookahead distance, though, the lookahead collapses onto the
+    // goal and the last centimeters are not steered reliably: stop at once.
+    constexpr double kSettledSpeed = 0.05;  // [m/s]
+    const bool       settled = std::abs(lastCommandedSpeed_) <= kSettledSpeed ||
+                         params.min_lookahead_dist <= 0;
+    const bool atGoalPosition =
+        nearPathEnd && distToGoal <= params.goal_dist_tol && settled;
+
+    // The end of this leg is followed by a pivot (see below)?
+    const bool lastLeg = legIdx_ + 1 >= legs_.size();
+
+    if (lastLeg && atGoalPosition &&
+        std::abs(out.heading_err) <= params.goal_ang_tol && !rotatingAtGoal_)
     {
-        // Latch: ReachedGoal is terminal until a new trajectory is set. The
-        // caller typically hands the vehicle to another controller on this
-        // status; if that controller then moves the robot off the completed
-        // path, an unlatched follower would re-awaken on the stale
-        // trajectory and fight it with full-speed commands (observed as a
-        // sustained crop-wall collision on a live run).
         arrived_            = true;
         lastCommandedSpeed_ = 0;
         out.status          = FollowerStatus::ReachedGoal;
         return out;  // empty command => node stops
     }
+
+    // At the goal position, but not yet at its heading: hold the position,
+    // and rotate in place if enabled (see below).
+    const bool canRotate =
+        lastLeg && params.rotate_at_goal && params.min_turn_radius <= 0;
+    if (atGoalPosition && canRotate) { arrived_ = true; }
 
     // Terminal stop latch: hold a stop once the robot, already within
     // `arrival_radius` of the goal (in both Euclidean distance and path
@@ -929,10 +1643,111 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     // obstacles.
     if (nearPathEnd)
     {
-        minDistToGoal_ = std::min(minDistToGoal_, distToGoal);
-        if (!arrived_ && distToGoal <= params.arrival_radius &&
-            distToGoal > minDistToGoal_ + 0.03)
-            arrived_ = true;
+        // Moving away from the goal only means the closest approach was
+        // passed if the reference path itself approaches the goal here: a
+        // final maneuver may first lead away from it (e.g. up to a cusp, to
+        // then back into the goal pose), and latching there would skip it.
+        // (Not looking past the next cusp, where the path turns back.)
+        constexpr double kDs       = 0.05;  // [m]
+        const double     nextCuspS = currentInterval_ < cuspS_.size()
+                                         ? cuspS_[currentInterval_]
+                                         : std::numeric_limits<double>::infinity();
+        const double     sAhead    = std::min(proj.s + kDs, nextCuspS);
+        const auto       pHere     = pointAtArc(proj.s);
+        const auto       pAhead    = pointAtArc(sAhead);
+        const bool       pathApproaches =
+            (proj.s + kDs >= totalLength() && !std::isfinite(nextCuspS)) ||
+            (sAhead > proj.s + 1e-3 &&
+             std::hypot(pAhead.x - goalPt.x, pAhead.y - goalPt.y) <
+                 std::hypot(pHere.x - goalPt.x, pHere.y - goalPt.y));
+
+        // Likewise, while still braking in the previous gear right after a
+        // cusp (overshoot), moving away is expected:
+        const bool movingInGear = gear * lastCommandedSpeed_ > 0.02;
+
+        if (!pathApproaches || !movingInGear)
+        {
+            minDistToGoal_ = std::numeric_limits<double>::infinity();
+        }
+        else
+        {
+            minDistToGoal_        = std::min(minDistToGoal_, distToGoal);
+            const bool movingAway = distToGoal > minDistToGoal_ + 0.03;
+            if (!arrived_ && movingAway && distToGoal <= params.arrival_radius)
+            {
+                arrived_ = true;
+            }
+            // Failsafe: past the path end (the projection is pinned to it)
+            // and moving away from the goal, but farther than
+            // `arrival_radius` (e.g. passing it to one side). Beyond this
+            // point the follower would only drive farther away, so settle
+            // here and report the goal as missed.
+            if (!arrived_ && movingAway && proj.s >= totalLength() - 1e-6)
+            {
+                arrived_      = true;
+                overshotGoal_ = true;
+            }
+        }
+    }
+    // At the end of a leg followed by a pivot (reached, or passed by): stop,
+    // rotate there, and go on with the next leg.
+    constexpr double kPivotDistTol = 0.02;  // [m]
+    if (!lastLeg && ((nearPathEnd && (distToGoal <= kPivotDistTol ||
+                                      (proj.s >= totalLength() - 1e-3 &&
+                                       distToGoal <= params.arrival_radius))) ||
+                     (arrived_ && !overshotGoal_)))
+    {
+        startLeg(legIdx_ + 1);
+        lastCommandedSpeed_ = 0;
+        if (auto o = pivotStep(ctrlPose, loc, odo, nowStamp); o) { return *o; }
+        out.command = inPlaceCommand(ctrlPose, loc, odo, 0.0);
+        out.status  = FollowerStatus::Running;
+        return out;
+    }
+
+    // Once rotating, finish well within the tolerance, not at its edge:
+    const double rotateUntil =
+        rotatingAtGoal_ ? 0.25 * params.goal_ang_tol : params.goal_ang_tol;
+    if (arrived_ && canRotate && !overshotGoal_ &&
+        std::abs(out.heading_err) > rotateUntil)
+    {
+        // Rotate in place to the goal heading, if the footprint is clear of
+        // obstacles over the whole rotation:
+        bool             clear    = true;
+        constexpr double kAngStep = mrpt::DEG2RAD(5.0);
+        for (double a = 0; clear && a < std::abs(out.heading_err) + kAngStep;
+             a += kAngStep)
+        {
+            const double        turned = std::min(a, std::abs(out.heading_err));
+            mrpt::math::TPose2D p      = ctrlPose;
+            p.phi -= std::copysign(turned, out.heading_err);
+            clear = footprintClearance(p) > params.safety_margin;
+        }
+        if (clear)
+        {
+            constexpr double kGain = 2.0;  // [1/s]
+            const double wMax = params.max_omega > 0 ? params.max_omega : 1.0;
+            double       w = std::clamp(-kGain * out.heading_err, -wMax, wMax);
+            if (params.max_omega_rate > 0.0)
+            {
+                const double dw = params.max_omega_rate * params.control_period;
+                w               = std::clamp(
+                                  w, lastCommandedOmega_ - dw, lastCommandedOmega_ + dw);
+            }
+            TrajSample smp;
+            smp.pose             = odo.valid ? odo.odometry : ctrlPose;
+            smp.twist            = {0.0, 0.0, w};
+            out.command.frame_id = params.emit_frame;
+            out.command.stamp    = loc.timestamp;
+            out.command.points.push_back(smp);
+            if (!recentCmds_.empty()) { recentCmds_.back() = {0.0, w}; }
+            lastCommandedSpeed_ = 0;
+            lastCommandedOmega_ = w;
+            lastCommandedCurv_  = 0;
+            rotatingAtGoal_     = true;
+            out.status          = FollowerStatus::Running;
+            return out;
+        }
     }
     if (arrived_)
     {
@@ -942,9 +1757,15 @@ TrajectoryFollower::Output TrajectoryFollower::step(
         // than hold `Running` forever -- which hangs the caller with the robot
         // parked and no resolution -- report the goal as reached (position
         // best-effort). Any residual heading is left to the downstream maneuver
-        // (e.g. the reactive corridor-follower that backs into the row).
+        // (e.g. a reactive controller for the last meters), unless
+        // `arrival_ang_tol` asks to report it as missed.
+        const bool headingMissed =
+            params.arrival_ang_tol > 0 &&
+            std::abs(out.heading_err) > params.arrival_ang_tol;
         lastCommandedSpeed_ = 0;
-        out.status          = FollowerStatus::ReachedGoal;
+        out.status          = headingMissed || overshotGoal_
+                                  ? FollowerStatus::MissedGoal
+                                  : FollowerStatus::ReachedGoal;
         out.target_speed    = 0;
         return out;  // empty command => node stops
     }
@@ -961,14 +1782,11 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     // localization glitch is left for the caller to debounce. In the
     // identity/static map->odom case (unit tests) ctrlPose == loc.pose, so this
     // is a no-op there.
-    const auto nowStamp =
-        loc.timestamp != INVALID_TIMESTAMP ? loc.timestamp : mrpt::Clock::now();
-
     double offPathCross = proj.cross_track;
-    if (loc.valid)
+    if (loc.valid && locComp)
     {
         offPathCross =
-            projectToPath({loc.pose.x, loc.pose.y}, proj.s).cross_track;
+            projectToPath({locNow.pose.x, locNow.pose.y}, proj.s).cross_track;
     }
     // Debounced fault: the raw-localization cross-track can spike
     // transiently (localization jitter), so OffPathExceeded only fires once
@@ -1006,23 +1824,63 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     double scale = 1.0;
     if (!obstacles_.empty())
     {
+        // If the vehicle is already within the safety margin of an obstacle
+        // (e.g. it was parked close to a wall), predict contact for motions
+        // that get it closer (beyond a small tolerance for sliding along it);
+        // otherwise it could never leave.
+        constexpr double kApproachTolerance = 0.01;  // [m]
+        const double     clearanceNow       = footprintClearance(ctrlPose);
+        const double     contactClearance   = std::min(
+                  params.safety_margin,
+                  std::max(0.0, clearanceNow - kApproachTolerance));
+
+        // The reference sweep must reach, at least, beyond the braking
+        // distance at the current speed:
+        const double refSweepDist = std::max(
+            params.reference_lookahead_dist,
+            params.slow_distance +
+                predV * predV / (2.0 * std::max(1e-3, params.max_decel)));
+
         const double dFwd = forecastContactDistance(
-            ctrlPose, predV, predOmega, predCurv, proj.s, gear);
-        const double dRef = referenceContactDistance(proj.s);
-        scale             = std::min(
-                        contactDistanceToScale(dFwd), contactDistanceToScale(dRef));
+            ctrlPose, predV, predOmega, predCurv, proj.s, gear,
+            contactClearance);
+        const double dRef =
+            referenceContactDistance(proj.s, refSweepDist, contactClearance);
+        scale = std::min(
+            contactDistanceToScale(dFwd), contactDistanceToScale(dRef));
+        out.contact_dist_forecast  = dFwd;
+        out.contact_dist_reference = dRef;
+    }
+    // The external speed cap (see setSpeedCap()) limits the speed itself
+    // (in pursuit()), and stops the vehicle like the predictive safety:
+    double stopScale = scale;
+    if (speedCap_ < params.max_speed)
+    {
+        stopScale = std::min(
+            stopScale,
+            std::max(0.0, speedCap_) / std::max(1e-6, params.max_speed));
+    }
+    // Too slow to be worth moving: stop (see safety_min_speed)
+    if (stopScale < 1.0 &&
+        stopScale * params.max_speed < params.safety_min_speed)
+    {
+        scale     = 0.0;
+        stopScale = 0.0;
     }
     if (stopped_)
     {
-        if (scale >= params.resume_scale)
+        if (stopScale >= params.resume_scale)
         {
             stopped_      = false;
             stoppedSince_ = INVALID_TIMESTAMP;
         }
         else
-            scale = 0.0;
+        {
+            scale     = 0.0;
+            stopScale = 0.0;
+        }
     }
-    if (!stopped_ && scale <= 1e-3)
+    if (!stopped_ && stopScale <= 1e-3)
     {
         stopped_      = true;
         stoppedSince_ = nowStamp;
@@ -1038,10 +1896,9 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     // Debug trace (off unless COutputLogger verbosity is raised to
     // LVL_DEBUG): one summary line per control cycle -- the actually
     // published/commanded state, as opposed to [pursuit]'s per-forecast-
-    // sample internals above. `rosT` is loc.timestamp (the pose's own
-    // stamp, i.e. the same UNIX-epoch convention as a ROS header.stamp when
-    // use_sim_time is false) rather than log-print wall time, so lines can
-    // be lined up against a recorded bag's topic timestamps directly.
+    // sample internals above. `rosT` is the odometry (else localization)
+    // timestamp rather than log-print wall time, so lines can be lined up
+    // against a recorded bag's topic timestamps directly.
     MRPT_LOG_DEBUG_STREAM(
         "[step] rosT=" << std::fixed << std::setprecision(6)
                        << mrpt::Clock::toDouble(nowStamp)
@@ -1097,6 +1954,12 @@ TrajectoryFollower::Output TrajectoryFollower::step(
         {
             out.target_speed    = cmd.v;
             out.lookahead_point = cmd.lookahead;
+            out.curvature       = cmd.curv;
+            out.gear            = gear;
+            if (!recentCmds_.empty())
+            {
+                recentCmds_.back() = {cmd.v, cmd.omega};
+            }
             // Persist for the next cycle's feedforward ramp seed.
             lastCommandedSpeed_ = cmd.v;
             lastCommandedOmega_ = cmd.omega;
@@ -1115,4 +1978,97 @@ TrajectoryFollower::Output TrajectoryFollower::step(
     }
 
     return out;
+}
+
+std::optional<TrajectoryFollower::Output> TrajectoryFollower::pivotStep(
+    const mrpt::math::TPose2D& ctrlPose, const VehicleLocalizationState& loc,
+    const VehicleOdometryState& odo, mrpt::system::TTimeStamp now)
+{
+    const auto& leg = legs_.at(legIdx_);
+    ASSERT_(leg.pivotTo.has_value());
+
+    // Remaining rotation, in the direction of the path, unless it overshot:
+    double remaining = mrpt::math::wrapToPi(*leg.pivotTo - ctrlPose.phi);
+    if (remaining * leg.pivotDir < -M_PI_2)
+    {
+        remaining += 2 * M_PI * leg.pivotDir;
+    }
+
+    Output out;
+    out.heading_err = -remaining;
+    if (std::abs(remaining) <= 0.25 * params.goal_ang_tol)
+    {
+        pivoting_ = false;
+        return std::nullopt;
+    }
+
+    // Is the footprint clear of obstacles over the whole rotation? (If it is
+    // already closer than the safety margin to some obstacle, it may not get
+    // any closer.)
+    bool clear = true;
+    if (!obstacles_.empty())
+    {
+        constexpr double kApproachTolerance = 0.01;  // [m]
+        constexpr double kAngStep           = mrpt::DEG2RAD(5.0);
+        const double     contactClearance   = std::min(
+                  params.safety_margin,
+                  std::max(0.0, footprintClearance(ctrlPose) - kApproachTolerance));
+        for (double a = kAngStep; clear && a < std::abs(remaining) + kAngStep;
+             a += kAngStep)
+        {
+            mrpt::math::TPose2D p = ctrlPose;
+            p.phi += std::copysign(std::min(a, std::abs(remaining)), remaining);
+            clear = footprintClearance(p) > contactClearance;
+        }
+    }
+
+    double w = 0;
+    if (clear)
+    {
+        constexpr double kGain = 2.0;  // [1/s]
+        const double     wMax  = params.max_omega > 0 ? params.max_omega : 1.0;
+        w                      = std::clamp(kGain * remaining, -wMax, wMax);
+        if (params.max_omega_rate > 0.0)
+        {
+            const double dw = params.max_omega_rate * params.control_period;
+            w               = std::clamp(
+                              w, lastCommandedOmega_ - dw, lastCommandedOmega_ + dw);
+        }
+        stopped_      = false;
+        stoppedSince_ = INVALID_TIMESTAMP;
+    }
+    else if (!stopped_)
+    {
+        stopped_      = true;
+        stoppedSince_ = now;
+    }
+    out.safety_scale = clear ? 1.0 : 0.0;
+    out.status       = FollowerStatus::Running;
+    if (stopped_ && stoppedSince_ != INVALID_TIMESTAMP &&
+        mrpt::system::timeDifference(stoppedSince_, now) >=
+            params.block_timeout)
+    {
+        out.status = FollowerStatus::Blocked;
+    }
+
+    out.command = inPlaceCommand(ctrlPose, loc, odo, w);
+    if (!recentCmds_.empty()) { recentCmds_.back() = {0.0, w}; }
+    lastCommandedSpeed_ = 0;
+    lastCommandedOmega_ = w;
+    lastCommandedCurv_  = 0;
+    return out;
+}
+
+SampledTrajectory TrajectoryFollower::inPlaceCommand(
+    const mrpt::math::TPose2D& ctrlPose, const VehicleLocalizationState& loc,
+    const VehicleOdometryState& odo, double omega) const
+{
+    SampledTrajectory cmd;
+    TrajSample        smp;
+    smp.pose     = odo.valid ? odo.odometry : ctrlPose;
+    smp.twist    = {0.0, 0.0, omega};
+    cmd.frame_id = params.emit_frame;
+    cmd.stamp    = loc.timestamp;
+    cmd.points.push_back(smp);
+    return cmd;
 }

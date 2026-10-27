@@ -6,9 +6,11 @@
 
 #include <mpp/algos/edge_interpolated_path.h>
 #include <mpp/algos/refine_trajectory.h>
+#include <mpp/ptgs/DiffDrive_Spin.h>
 #include <mpp/ptgs/SpeedTrimmablePTG.h>
 #include <mrpt/math/wrap2pi.h>
 
+#include <cmath>
 #include <iostream>
 
 // see docs in .h
@@ -46,6 +48,35 @@ void mpp::refine_trajectory(
 #endif
 
         const auto deltaNodes = endNode.pose - startNode.pose;
+
+        // Rotations in place are re-fitted by heading instead (a residual
+        // translation, from the lattice rounding of the end node, is kept):
+        if (const auto* spin =
+                dynamic_cast<const ptg::DiffDrive_Spin*>(ptg.get());
+            spin)
+        {
+            // Half turns end at the same pose both ways: keep the direction
+            // the planner checked.
+            const double planned =
+                spin->getTrajectoryRotation(edge.ptgPathIndex);
+            double rotation = mrpt::math::wrapToPi(deltaNodes.phi);
+            if (rotation * planned < 0 && std::abs(rotation) > M_PI - 1e-3)
+            {
+                rotation = std::copysign(M_PI, planned);
+            }
+            const auto ks = spin->rotationToTrajectoryStep(rotation);
+            if (ks && (ks->first != edge.ptgPathIndex ||
+                       ks->second != edge.ptgStepIndex))
+            {
+                edge.ptgPathIndex = ks->first;
+                edge.ptgStepIndex = ks->second;
+                edge.ptgDist      = ptg->getPathDist(ks->first, ks->second);
+                edge_interpolated_path(
+                    edge, ptgInfo, ptg->getPathPose(ks->first, ks->second),
+                    ks->second);
+            }
+            continue;
+        }
 
         // Should never happen, except in buggy callers:
         if (deltaNodes.x == 0 && deltaNodes.y == 0) continue;
@@ -88,16 +119,17 @@ void mpp::refine_trajectory(
             const normalized_distance_t newNormDist = invMap->second;
             distance_t newDist = newNormDist * ptg->getRefDistance();
 
-            uint32_t   newPtgStep = 0;
-            const bool stepOk =
-                ptg->getPathStepForDist(newK, newDist, newPtgStep);
-            if (!stepOk)
+            const auto     stepOpt = ptg->getPathStepForDist(newK, newDist);
+            const uint32_t newPtgStep =
+                stepOpt ? *stepOpt
+                        : ptg->getPathStepForDistClamped(newK, newDist);
+            if (!stepOpt)
             {
                 // The distance returned by inverseMap_WS2TP() (normalized
                 // against refDistance) can slightly exceed the actual length
                 // of the simulated trajectory "newK", in which case
-                // getPathStepForDist() returns false and leaves out_step at
-                // the last sample. Committing such an out-of-range ptgDist
+                // getPathStepForDist() has no result and the step falls back
+                // to the last sample. Committing such an out-of-range ptgDist
                 // makes a later plan_to_trajectory() assert fail. Clamp the
                 // distance to the last representable sample of "newK".
                 newDist = ptg->getPathDist(newK, newPtgStep);
@@ -111,6 +143,7 @@ void mpp::refine_trajectory(
 
             edge.ptgPathIndex = newK;
             edge.ptgDist      = newDist;
+            edge.ptgStepIndex = newPtgStep;
 
             // Update interpolated path. It must end at the pose actually
             // reached by the PTG: the (x,y)-only inverse map above may not

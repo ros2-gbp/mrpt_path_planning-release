@@ -238,7 +238,57 @@ class MotionPrimitivesTree : public mrpt::graphs::CDirectedTree<EDGE_TYPE>
         nodes_[node_id] = node_t(node_id, {}, node_data, zeroCost);
     }
 
-    TNodeID next_free_node_ID() const { return nodes_.size(); }
+    /** An ID not used by any node (IDs are kept by prune_to_subtree(), so
+     * they may not be contiguous). */
+    TNodeID next_free_node_ID() const
+    {
+        if (nodes_.empty()) { return 0; }
+        return nodes_.rbegin()->first + 1;
+    }
+
+    /** Keeps only the subtree hanging from `newRoot`, which becomes the root.
+     * Node costs become relative to the new root (its former cost is
+     * subtracted), so they keep matching any search costs rebased the same
+     * way.
+     * \return The IDs of the kept nodes (including `newRoot`). */
+    std::set<TNodeID> prune_to_subtree(const TNodeID newRoot)
+    {
+        ASSERTMSG_(
+            nodes_.count(newRoot) != 0,
+            "prune_to_subtree(): node not found in the tree");
+
+        const cost_t        rootCost = nodes_.at(newRoot).cost_;
+        std::set<TNodeID>   kept;
+        std::deque<TNodeID> pending = {newRoot};
+        while (!pending.empty())
+        {
+            const TNodeID id = pending.front();
+            pending.pop_front();
+            kept.insert(id);
+            nodes_.at(id).cost_ -= rootCost;
+            const auto it = base_t::edges_to_children.find(id);
+            if (it == base_t::edges_to_children.end()) { continue; }
+            for (const auto& e : it->second) { pending.push_back(e.id); }
+        }
+
+        for (auto it = nodes_.begin(); it != nodes_.end();)
+        {
+            if (kept.count(it->first) == 0) { it = nodes_.erase(it); }
+            else { ++it; }
+        }
+        for (auto it = base_t::edges_to_children.begin();
+             it != base_t::edges_to_children.end();)
+        {
+            if (kept.count(it->first) == 0)
+            {
+                it = base_t::edges_to_children.erase(it);
+            }
+            else { ++it; }
+        }
+        nodes_.at(newRoot).parentID_.reset();
+        base_t::root = newRoot;
+        return kept;
+    }
 
     /** read-only access to nodes.
      * \sa  insert_node_and_edge, insert_node
@@ -347,13 +397,12 @@ struct PoseDistanceMetric_TPS<SE2_KinState>
 
         if (tp_point_is_exact)
         {
-            uint32_t ptg_step;
-            ptg_.getPathStepForDist(k, d, ptg_step);
-            const auto   reconsRelPose = ptg_.getPathPose(k, ptg_step);
-            const double headingError =
+            const uint32_t ptg_step      = ptg_.getPathStepForDistClamped(k, d);
+            const auto     reconsRelPose = ptg_.getPathPose(k, ptg_step);
+            const double   headingError =
                 ignoreDstHeading ? .0
-                                 : std::abs(mrpt::math::angDistance(
-                                       reconsRelPose.phi, relPose.phi));
+                                   : std::abs(mrpt::math::angDistance(
+                                         reconsRelPose.phi, relPose.phi));
 
             if (headingError > headingTolerance_) tp_point_is_exact = false;
         }

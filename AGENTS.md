@@ -34,11 +34,13 @@ Three colcon/ROS 2 packages, each with its own `package.xml` and
 mrpt_path_planning_core/        Headless library. CMake package and target:
 │                               find_package(mrpt_path_planning) / mpp::mrpt_path_planning
 ├── include/mpp/algos/          Planners (TPS_Astar, TPS_Astar_Bidir), cost evaluators,
-│                               NavEngine, TrajectoryFollower, collision/interpolation
-│                               helpers, 3D scene and SVG rendering (no windowing)
+│                               TrajectoryFollower, CollisionGuard,
+│                               collision/interpolation helpers, 3D scene and SVG
+│                               rendering (no windowing)
 ├── include/mpp/data/           Planner I/O, SE(2) states, motion tree, trajectories
 ├── include/mpp/interfaces/     Obstacle sources, vehicle interfaces
-├── include/mpp/ptgs/           PTG implementations (DiffDrive_C, HolonomicBlend)
+├── include/mpp/ptgs/           PTG implementations (DiffDrive_C, DiffDrive_Spin,
+│                               HolonomicBlend)
 ├── src/                        Implementations; registerClasses.cpp registers RTTI classes
 ├── tests/                      GTest suite
 ├── doc/                        Doxygen/Sphinx sources
@@ -46,7 +48,8 @@ mrpt_path_planning_core/        Headless library. CMake package and target:
 mrpt_path_planning_apps/        Needs mrpt_gui, cli11, mvsim (optional)
 ├── path-planner-cli/           Planning CLI (3D viz window, or --no-gui)
 ├── mrpt_path_planning_viz/     Private 3D visualization helpers for the apps
-├── selfdriving-simulator-gui/  Live navigation demo on mvsim
+├── selfdriving-simulator-gui/  Live navigation demo on mvsim (TPS_Astar + TrajectoryFollower,
+│                               GUI panel via mvsim's declarative panel API)
 └── share/                      Example PTG .ini, planner/costmap .yaml, maps (installed)
 mrpt_path_planning/             Backward-compatible metapackage, no code
 docs/images/                    README images (animated SVGs from path-planner-cli --save-svg)
@@ -66,6 +69,12 @@ colcon test --base-paths . && colcon test-result --all --verbose
   PPA, and checks formatting.
 - Format C++ with `clang-format-14` using the repo `.clang-format`.
 - New algorithms need GTest coverage in `mrpt_path_planning_core/tests/`.
+- `tests/test_trajectory_follower_closed_loop.cpp` judges the follower on the
+  simulated ground truth, with localization latency, noise and actuation delays
+  (`MPP_FOLLOWER_TRACE_DIR` dumps traces for `tests/plot_follower_traces.py`).
+- `tests/test_trajectory_follower.cpp` covers typical generated maneuvers
+  (e.g. `CurveExit*`: backing into a narrow aisle, quarter-ellipse turns) at the
+  knot pitch of a waypoint generator.
 
 ## Conventions
 
@@ -77,6 +86,9 @@ colcon test --base-paths . && colcon test-result --all --verbose
   `params_from_yaml()`); PTGs are configured from INI sections.
 - No one-line `if` bodies, one variable per declaration, anonymous namespaces
   instead of `static` for file-local symbols.
+- New public APIs that downstream packages (e.g. `mrpt_navigation`) use get a
+  feature macro (`#define MPP_HAS_<FEATURE> 1` in their header), so consumers
+  keep building against older versions.
 
 ## Core concepts
 
@@ -84,8 +96,10 @@ colcon test --base-paths . && colcon test-result --all --verbose
 traveled distance `d` and, for speed-trimmable PTGs, a speed scale in `[0,1]`.
 It maps `(k, step)` to pose and twist, and workspace points back to TP-Space
 (`inverseMap_WS2TP`). `DiffDrive_C` generates circular arcs (with `K=-1` for
-reverse motion); `HolonomicBlend` generates holonomic motions with velocity
-ramps defined by runtime-compiled expressions.
+reverse motion); `DiffDrive_Spin` rotates in place (trajectory `k` turns by up
+to +-pi, no inverse map; A\* samples it by angle, `spin_sample_angles`);
+`HolonomicBlend` generates holonomic motions with velocity ramps defined by
+runtime-compiled expressions.
 
 **TP-Space collision checking.** Obstacles in the robot frame are projected
 into TP-Space: for each trajectory `k`, the free distance before collision.
@@ -105,7 +119,9 @@ parent is found.
 Euclidean distance; both add a heading-alignment term and are divided by the
 maximum PTG speed so they are in time units. Optional: Reeds-Shepp distance
 (`use_reeds_shepp_heuristic`, requires all PTGs to be `DiffDrive_C`), and
-weighted A\* via `heuristic_epsilon` (default 1.0, i.e. exact A\*).
+weighted A\* via `heuristic_epsilon` (default 1.5; 1.0 is exact A\*).
+With a `DiffDrive_Spin` PTG the angular terms are scaled down so they never
+exceed the rotation time (consistency along rotations).
 
 **Reeds-Shepp shot** (`use_reeds_shepp_expansion`). Near the goal, a
 Reeds-Shepp path is executed as a chain of forward/reverse C-PTG edges, each
@@ -114,24 +130,74 @@ itself, not only in its cell. Pose goals: the shortest path to the pose. Point
 goals: the shortest path to the point with a free final heading, else the
 shortest one to any sampled heading at which the footprint fits at the goal
 (none: no shots). A search reaching the goal cell first tries a shot from there.
+With a `DiffDrive_Spin` PTG, a spin shot (rotate, straight C-PTG edge, rotate;
+`use_spin_expansion`) is tried the same way, and the cheapest clear shot wins.
+
+**Robot description.** The PTG `.ini` section (`TrajectoriesAndRobotShape`)
+holds the PTGs, the footprint (`RobotModel_shape2D_*` or a radius) and the
+vehicle's physical `RobotModel_min_turning_radius`; C-PTGs turning tighter, or
+any `DiffDrive_Spin` if it is > 0, are rejected when loaded. It is the single
+source of truth shared by planner and follower. PTG collision grids are cached
+in `~/.cache/mrpt_path_planning` (or `$XDG_CACHE_HOME`), named by a hash of
+their configuration. `initFromConfigFile()` can report per-PTG progress
+(`InitProgressCallback`, `MPP_HAS_PTG_INIT_PROGRESS`).
 
 **Cost model.** Edge cost = PTG segment estimated execution time + the sum of
-cost evaluators: `CostEvaluatorCostMap` (obstacle-proximity penalty) and
-`CostEvaluatorPreferredWaypoint` (reward near given waypoints).
+cost evaluators (each a penalty per second of motion, or per radian turned,
+so edge splitting does not change it): `CostEvaluatorCostMap`
+(obstacle-proximity penalty), `CostEvaluatorPreferredWaypoint` (reward near
+given waypoints), `CostEvaluatorReverseMotion` (extra cost per second driven
+in reverse) and `CostEvaluatorTurning` (extra cost per radian of heading
+change, against weaving paths; stopping a moving robot, at a cusp or to
+rotate in place, counts as pi).
 
 **Bidirectional A\* (`TPS_Astar_Bidir`).** Searches forward from the start and
 backward from the goal (predecessors from inverted PTG relative poses) until
 both settle the same lattice cell, then stitches and refines the path. C-PTGs
-only; the core always runs exact A\*.
+and `DiffDrive_Spin` only; the core always runs exact A\*.
+
+**Resumable search.** `plan()` is `start()` plus one `run()`; the search state
+lives in `TPS_Astar` (`SearchState`) between calls. Callers can `run()` in time
+slices (anytime: `bestNodeId` is the best partial path so far), `reroot()` the
+search at a tree node ahead on the executed path (only its subtree is kept,
+other lattice cells are freed), and `set_obstacles()` for later expansions.
+`run_slice()` + `path_to_node()` avoid copying the tree on each call.
+`first_colliding_edge()` validates a planned path against new obstacles
+(`tests/test_astar_resumable.cpp`). Only `TPS_Astar` supports it, not Bidir.
 
 **Post-processing.** `refine_trajectory()` re-fits PTG parameters so edges
-connect the exact node poses; `plan_to_trajectory()` samples the path in time.
+connect the exact node poses (rotations in place: by heading);
+`plan_to_trajectory()` samples the path in time.
 
-**Navigation.** `NavEngine` is a state machine for waypoint-sequence navigation
-with a planner thread, enqueued motion commands and `VehicleMotionInterface`.
-`TrajectoryFollower` is a ROS-free pure-pursuit core with predictive safety
-(footprint sweep against live obstacles), consuming a `Trajectory` and emitting
-`SampledTrajectory` chunks via `TrajectoryVehicleInterface`.
+**Navigation.** `TrajectoryFollower` is a ROS-free path tracker: reference
+curvature feedforward plus pure-pursuit feedback, with predictive safety
+(footprint sweep against live obstacles, braking-distance aware; speed caps
+below `safety_min_speed` are stops, not crawling), consuming a
+`Trajectory` and emitting `SampledTrajectory` chunks via
+`TrajectoryVehicleInterface`. Delayed localizations are brought to the present
+with odometry using their timestamps (callers must pass the sensor time, on the
+same clock as the odometry), and `control_delay` predicts past known dead times.
+Arc-length progress never skips or goes back across a cusp. `updateTrajectory()`
+swaps in a path that continues the current one (e.g. replanned) without
+restarting the motion state, so the robot does not slow down. Its speed profile
+anticipates path curvature and stops (goal, cusps) over the braking distance, so
+the same parameters work at any speed. Passing the path end away from the goal,
+outside the arrival radius, it stops and reports `MissedGoal` so the caller can
+replan; `rotate_at_goal` lets differential-drive robots finish by rotating in
+place to the goal heading. Pivots (heading changes in place, e.g. planned
+rotations) split the path into legs: the follower stops at each one and rotates
+in place in the planned direction (`pivot_in_place`; not for car-like robots).
+`ReachedGoal` and `MissedGoal` are terminal: no more commands until a new path.
+For car-like robots, `min_turn_radius` clamps the commanded curvature and
+`max_curvature_rate` models the steering slew; the
+pure-pursuit lookahead shortens where the path bends (`lookahead_bend`) and is
+kept at least `min_lookahead_dist` away so localization noise does not drive
+the steering. `CollisionGuard` is an independent last-resort filter
+for velocity commands: using only robot-frame sensed points, it caps the speed
+so the robot can always stop along the commanded arc before contact (stale data:
+stop). Its `Result::max_speed` for the motion the follower wants
+(`Output::curvature`, `Output::gear`), fed back with `setSpeedCap()`, makes the
+follower slow down before the guard has to cut its commands.
 
 ## TPS_Astar::plan() flow
 
@@ -164,13 +230,26 @@ with a planner thread, enqueued motion commands and `VehicleMotionInterface`.
   (`refDistance + robotRadius + clearance`).
 - **Goal semantics.** R(2) goals match position only (`sameLocation()`); SE(2)
   goals match all three coordinates.
+- **Start within clearance.** If the start pose is closer than the PTG clearance
+  to obstacles (but not in collision), edges leaving it use an exact footprint
+  sweep that only forbids getting closer (`tests/test_astar_start_clearance.cpp`).
+- **Collision guard soundness.** With a reaction time covering the control
+  period and actuation lag, the guard never lets a vehicle with the assumed
+  braking reach an obstacle (`tests/test_collision_guard.cpp`, closed loop).
+  Once within `margin`, repeated commands toward an obstacle stop at half
+  the clearance it had when getting that close, never creeping closer.
+- **Reentrancy.** Evaluating a PTG changes its state (dynamic state, speed
+  trim, caches), so concurrent planners must each use their own PTGs from
+  `TrajectoriesAndRobotShape::clone()`; PTG copies must stay independent
+  (`tests/test_ptg_clone.cpp`).
 - **Admissibility.** With `heuristic_epsilon = 1`, heuristics must stay
   admissible and consistent (`tests/test_heuristic.cpp`,
   `tests/test_reeds_shepp.cpp`).
 
 ## Known limitations
 
-- Obstacles are static during a plan (no time-dependent obstacles).
+- Obstacles are static during a plan (no time-dependent obstacles), except
+  for `set_obstacles()` between `run()` slices.
 - Trajectory indices are sampled uniformly plus the direct-to-goal direction;
   maneuvers through narrow gaps may be missed.
 - No global path smoothing or shortcutting beyond `refine_trajectory()`.

@@ -1,0 +1,13 @@
+Source: ros-jazzy-mrpt-path-planning-core
+Section: misc
+Priority: optional
+Maintainer: "Jose-Luis Blanco-Claraco" <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, libgtest-dev <!nocheck>, ros-jazzy-mrpt-containers, ros-jazzy-mrpt-graphs, ros-jazzy-mrpt-maps, ros-jazzy-mrpt-nav, ros-jazzy-ros-workspace
+Homepage: https://github.com/MRPT/mrpt_path_planning
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-mrpt-path-planning-core
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-mrpt-containers, ros-jazzy-mrpt-graphs, ros-jazzy-mrpt-maps, ros-jazzy-mrpt-nav, ros-jazzy-ros-workspace
+Description: Path planning and navigation algorithms for robots/vehicles moving on planar environments.
+ This library builds upon mrpt-nav and the theory behind PTGs to generate libraries of &quot;motion primitives&quot; for vehicles with arbitrary shape and realistic kinematics and dynamics. Headless: no GUI/display dependency. See mrpt_path_planning_apps for the CLI/GUI applications.

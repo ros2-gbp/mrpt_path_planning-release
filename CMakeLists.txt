@@ -48,16 +48,19 @@ find_package(mrpt_maps REQUIRED)
 # re-triggers CMake configure).
 set(LIB_SRCS
 	src/algos/bestTrajectory.cpp
+	src/algos/CollisionGuard.cpp
 	src/algos/CostEvaluator.cpp
 	src/algos/CostEvaluatorCostMap.cpp
 	src/algos/CostEvaluatorPreferredWaypoint.cpp
+	src/algos/CostEvaluatorReverseMotion.cpp
+	src/algos/CostEvaluatorTurning.cpp
 	src/algos/edge_interpolated_path.cpp
-	src/algos/NavEngine.cpp
 	src/algos/Planner.cpp
 	src/algos/reeds_shepp.cpp
 	src/algos/refine_trajectory.cpp
 	src/algos/render_tree.cpp
 	src/algos/render_vehicle.cpp
+	src/algos/path_collision_check.cpp
 	src/algos/tp_obstacles_single_path.cpp
 	src/algos/TPS_Astar.cpp
 	src/algos/TPS_Astar_Bidir.cpp
@@ -73,9 +76,8 @@ set(LIB_SRCS
 	src/data/TrajectoriesAndRobotShape.cpp
 	src/data/Waypoints.cpp
 	src/interfaces/ObstacleSource.cpp
-	src/interfaces/TargetApproachController.cpp
-	src/interfaces/VehicleMotionInterface.cpp
 	src/ptgs/DiffDrive_C.cpp
+	src/ptgs/DiffDrive_Spin.cpp
 	src/ptgs/DiffDriveCollisionGridBased.cpp
 	src/ptgs/HolonomicBlend.cpp
 	src/registerClasses.cpp
@@ -83,16 +85,18 @@ set(LIB_SRCS
 
 set(LIB_PUBLIC_HDRS
 	include/mpp/algos/bestTrajectory.h
+	include/mpp/algos/CollisionGuard.h
 	include/mpp/algos/CostEvaluator.h
 	include/mpp/algos/CostEvaluatorCostMap.h
 	include/mpp/algos/CostEvaluatorPreferredWaypoint.h
+	include/mpp/algos/CostEvaluatorReverseMotion.h
 	include/mpp/algos/edge_interpolated_path.h
-	include/mpp/algos/NavEngine.h
 	include/mpp/algos/Planner.h
 	include/mpp/algos/reeds_shepp.h
 	include/mpp/algos/refine_trajectory.h
 	include/mpp/algos/render_tree.h
 	include/mpp/algos/render_vehicle.h
+	include/mpp/algos/path_collision_check.h
 	include/mpp/algos/tp_obstacles_single_path.h
 	include/mpp/algos/TPS_Astar.h
 	include/mpp/algos/TPS_Astar_Bidir.h
@@ -103,7 +107,6 @@ set(LIB_PUBLIC_HDRS
 	include/mpp/algos/within_bbox.h
 	include/mpp/data/basic_types.h
 	include/mpp/data/const_ref_t.h
-	include/mpp/data/EnqueuedMotionCmd.h
 	include/mpp/data/MotionPrimitivesTree.h
 	include/mpp/data/MoveEdgeSE2_TPS.h
 	include/mpp/data/PlannerInput.h
@@ -122,10 +125,9 @@ set(LIB_PUBLIC_HDRS
 	include/mpp/data/Waypoints.h
 	include/mpp/interfaces/LidarSource.h
 	include/mpp/interfaces/ObstacleSource.h
-	include/mpp/interfaces/TargetApproachController.h
 	include/mpp/interfaces/TrajectoryVehicleInterface.h
-	include/mpp/interfaces/VehicleMotionInterface.h
 	include/mpp/ptgs/DiffDrive_C.h
+	include/mpp/ptgs/DiffDrive_Spin.h
 	include/mpp/ptgs/DiffDriveCollisionGridBased.h
 	include/mpp/ptgs/HolonomicBlend.h
 	include/mpp/ptgs/SpeedTrimmablePTG.h

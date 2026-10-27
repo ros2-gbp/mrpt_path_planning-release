@@ -16,7 +16,13 @@
 
 #include <limits>
 #include <optional>
+#include <queue>
+#include <tuple>
 #include <unordered_map>
+
+/** Feature macro: TPS_Astar has the resumable search API (start(), run(),
+ * reroot(), set_obstacles()). */
+#define MPP_HAS_RESUMABLE_ASTAR 1
 
 namespace mpp
 {
@@ -30,29 +36,24 @@ struct TPS_Astar_Parameters
 
     double grid_resolution_xy = 0.20;
 
-    /** Default 7.5 deg (48 yaw bins). A finer 5 deg was found to over-resolve
-     * the yaw dimension: since the heuristic is essentially positional, finer
-     * yaw multiplies SE(2) expansions ~linearly with no quality gain. Measured
-     * (collision-sound, 300-world BARN + 40-case HouseExpo): 5->7.5 deg cuts
-     * mean plan time ~23-37% and HouseExpo median ~1.5x while *improving*
-     * success (BARN 291->292/300, HouseExpo 39->40/40) at unchanged median path
-     * quality. 10 deg is faster still but drops net BARN success, so 7.5 deg is
-     * the sweet spot. See DESIGN.md sec 12.7. */
+    /** Default 7.5 deg (48 yaw bins). Since the heuristic is essentially
+     * positional, a finer yaw resolution multiplies the expansions with no
+     * quality gain, while a coarser one loses success rate. */
     double grid_resolution_yaw = 7.5_deg;
 
     double SE2_metricAngleWeight = 1.0;
 
     double heuristic_heading_weight = 0.1;  //!< [0,1]
 
-    /** Weighted-A* heuristic inflation factor `eps >= 1` (default 1.0 = exact
-     * A*). The open set is ordered by `f = g + eps * h`. Values `> 1` make the
-     * search greedier: it expands far fewer nodes and returns a solution whose
-     * cost is provably within a factor `eps` of the optimum (bounded
-     * sub-optimality, as in ARA* / SBPL). Since the planner's expensive worlds
-     * are dominated by expansion count, `eps` in `[1.5, 2]` is the cheapest
-     * lever to cut the worst-case latency tail at a small, bounded path-cost
-     * increase. Found to be 1.5 to be somehow better in runtime than 1.0 in
-     * general cases. */
+    /** Weighted-A* heuristic inflation factor `eps >= 1` (1.0 = exact
+     * A*, default 1.5). The open set is ordered by `f = g + eps * h`. Values `>
+     * 1` make the search greedier: it expands far fewer nodes and returns a
+     * solution whose cost is provably within a factor `eps` of the optimum
+     * (bounded sub-optimality, as in ARA* / SBPL). Since the planner's
+     * expensive worlds are dominated by expansion count, `eps` in `[1.5, 2]` is
+     * the cheapest lever to cut the worst-case latency tail at a small, bounded
+     * path-cost increase. Found to be 1.5 to be somehow better in runtime
+     * than 1.0 in general cases. */
     double heuristic_epsilon = 1.5;
 
     /** Analytic expansion / early termination:
@@ -105,6 +106,26 @@ struct TPS_Astar_Parameters
      * (so that one is straight); otherwise it is silently not used. */
     bool   use_reeds_shepp_expansion        = true;
     double reeds_shepp_expansion_max_length = 5.0;
+
+    /** Rotations in place [rad] tried from every expanded node, in both
+     * directions, if there is a rotation in place PTG (DiffDrive_Spin). A
+     * node also tries to face the goal (forward and backward) and, for a
+     * full-pose goal, the goal heading. Rotations smaller than half
+     * `grid_resolution_yaw` are skipped. In YAML, in degrees. */
+    std::vector<double> spin_sample_angles = {
+        45.0_deg, 90.0_deg, 135.0_deg, 180.0_deg};
+
+    /** Try a spin shot from expanded nodes within
+     * `reeds_shepp_expansion_max_length` [m] of the goal: rotate in place to
+     * face the goal (or away from it, to back into it), drive straight to
+     * it, and, for a full-pose goal, rotate in place to the goal heading. It
+     * requires a rotation in place PTG (DiffDrive_Spin) and a C-PTG with an
+     * odd number of trajectories (so that one is straight); otherwise it is
+     * silently not used. As the Reeds-Shepp shot, each edge is collision
+     * checked, a clear shot becomes a goal candidate (so
+     * `use_analytic_expansion` must be enabled), and it ends at the goal
+     * itself. If both shots are clear, the cheapest one is used. */
+    bool use_spin_expansion = true;
 
     uint32_t                        max_ptg_trajectories_to_explore = 20;
     std::vector<duration_seconds_t> ptg_sample_timestamps     = {1.0, 3.0, 5.0};
@@ -160,9 +181,82 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
     TPS_Astar();
     virtual ~TPS_Astar() = default;
 
+    /** Copies the configuration (parameters, cost evaluators, logger) but not
+     * the search state, which points into the lattice of the source. The copy
+     * uses the default heuristic bound to itself. */
+    TPS_Astar(const TPS_Astar& o);
+    TPS_Astar& operator=(const TPS_Astar& o);
+
     TPS_Astar_Parameters params_;
 
     PlannerOutput plan(const PlannerInput& in) override;
+
+    /** @name Resumable search
+     * plan() is start() followed by one run(). Calling them separately lets
+     * a caller search in time slices, use the best path found so far before
+     * the search ends (anytime planning), move the root of the search along
+     * the path being executed (reroot()), and update the obstacles for the
+     * rest of the search (set_obstacles()).
+     * Feature macro: MPP_HAS_RESUMABLE_ASTAR.
+     * @{ */
+
+    /** Starts a new search (expands no node yet). */
+    void start(const PlannerInput& in);
+
+    /** Continues the search started with start() for up to
+     * `maxComputationTime` [s], or until it ends. \return The current
+     * result: success if the goal was reached, otherwise `bestNodeId` is the
+     * node closest to the goal (by the heuristic) found so far. Edges along
+     * the path to `bestNodeId` are interpolated. */
+    PlannerOutput run(duration_seconds_t maxComputationTime);
+
+    /** Light result of a search slice (see run_slice()). */
+    struct SliceResult
+    {
+        bool   success          = false;
+        double computationTime  = 0;  //!< total [s]
+        size_t numExpandedNodes = 0;
+        double pathCost         = std::numeric_limits<double>::max();
+        std::optional<mrpt::graphs::TNodeID> goalNodeId;
+        std::optional<mrpt::graphs::TNodeID> bestNodeId;
+        cost_t bestNodeIdCostToGoal = std::numeric_limits<cost_t>::max();
+    };
+
+    /** Like run(), but without copying the motion tree: returns only ids and
+     * costs. Use path_to_node() to get the path. */
+    SliceResult run_slice(duration_seconds_t maxComputationTime);
+
+    /** Nodes and edges of the path from the search root to `nodeId` (e.g.
+     * `SliceResult::bestNodeId`), with the edges interpolated. They point into
+     * the search tree: valid until the next run(), reroot() or start(). */
+    std::tuple<
+        MotionPrimitivesTreeSE2::path_t,
+        MotionPrimitivesTreeSE2::edge_sequence_t>
+        path_to_node(mrpt::graphs::TNodeID nodeId);
+
+    /** Whether start() was called and the search can go on (the goal was
+     * not reached yet, and the open set is not empty). */
+    [[nodiscard]] bool search_can_continue() const;
+
+    /** Whether the search reached the goal. */
+    [[nodiscard]] bool search_reached_goal() const { return search_.found; }
+
+    /** Makes the tree node `newRoot` the new start of the search: only its
+     * subtree is kept (lattice cells of the other nodes are freed, so they
+     * can be reached again from it), costs are relative to it, and the
+     * search goes on from the open nodes of the subtree. The path from the
+     * old root to `newRoot` is thus committed. Visited nodes of the subtree
+     * are not expanded again, so freed cells only become reachable from its
+     * open nodes.
+     * \return false if `newRoot` is not in the tree (nothing is changed). */
+    bool reroot(mrpt::graphs::TNodeID newRoot);
+
+    /** Replaces the obstacles for the rest of the search. Edges already in
+     * the tree are not checked again: callers must validate the path they
+     * use against the new obstacles. */
+    void set_obstacles(const std::vector<ObstacleSource::Ptr>& obstacles);
+
+    /** @} */
 
     mrpt::containers::yaml params_as_yaml() override
     {
@@ -183,7 +277,8 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
         const SE2_KinState& from, const mrpt::math::TPoint2D& goal) const;
 
     /** Minimum turning radius of a set of DiffDrive_C PTGs (the Reeds-Shepp
-     * heuristic radius), or 0 if any PTG is of another type. */
+     * heuristic radius), or 0 if any PTG is of another type (the Reeds-Shepp
+     * distance is not a lower bound with rotations in place). */
     static double reeds_shepp_turning_radius(
         const TrajectoriesAndRobotShape& trs);
 
@@ -437,6 +532,32 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
 
     std::vector<float> localObsX_, localObsY_;
 
+    /** Start pose of the current plan, and handling of a start closer than
+     * the PTG clearance to some obstacle (e.g. a robot that stopped close to
+     * a wall): the clearance-inflated collision grids would then block every
+     * motion, so edges leaving the start are instead checked with an exact
+     * footprint sweep that only forbids getting closer than
+     * `startSweepThreshold_` (half the current distance, at most the
+     * clearance) to any obstacle. If the start pose already touches some
+     * obstacles (e.g. a robot that stopped in contact, or sensor noise),
+     * those may not get any closer than they are (`startObstacleDist0_`),
+     * so the robot can still move away from them. See
+     * local_obstacles_to_buffers() and start_edge_is_clear(). */
+    std::optional<mrpt::math::TPose2D> startPose_;
+    RobotShape                         startRobotShape_;
+    double                             startClearance_       = 0;
+    bool                               startWithinClearance_ = false;
+    double                             startSweepThreshold_  = 0;
+    std::vector<mrpt::math::TPoint2D>  startLocalObstacles_;
+    /** Signed distance of each startLocalObstacles_ point to the footprint
+     * at the start pose, only if the start touches obstacles (else empty) */
+    std::vector<double> startObstacleDist0_;
+
+    /** Exact sweep check of an edge leaving the start pose (only used if
+     * startWithinClearance_). */
+    bool start_edge_is_clear(
+        const ptg_t& ptg, trajectory_index_t k, uint32_t step) const;
+
     /** Free distance along every trajectory of each PTG (indexed as the PTGs)
      * from `expandedTpObstaclesPose_`, the pose of the last node expanded by
      * find_feasible_paths_to_neighbors(). Its Reeds-Shepp shots start there,
@@ -460,6 +581,25 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
      * Set in plan() from the PTGs. */
     double reedsSheppTurningRadius_ = 0.0;
 
+    /** Index of the rotation in place PTG (DiffDrive_Spin), if any. Set in
+     * start(). */
+    std::optional<size_t> spinPtgIndex_;
+
+    /** Scale of the angular terms of the SE(2) heuristic (1 = none). With
+     * rotations in place, they are scaled so that they never exceed the
+     * rotation time, which keeps the heuristic consistent along rotation
+     * edges. Set in start(). */
+    double heuristicAngleScale_ = 1.0;
+
+    /** Sets spinPtgIndex_ and heuristicAngleScale_ from the PTGs (after
+     * maxLinSpeed_). */
+    void prepare_rotations_in_place(const TrajectoriesAndRobotShape& trs);
+
+    /** Rotations in place [rad] to try from `from` (see spin_sample_angles).
+     */
+    std::vector<double> spin_angles_to_sample(
+        const mrpt::math::TPose2D& from, const SE2orR2_KinState& goal) const;
+
     /** Trajectories of one C-PTG used by the Reeds-Shepp shot. */
     struct RsExpansionPtg
     {
@@ -476,6 +616,20 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
     /** Sets rsForward_, rsReverse_ and rsExpansionRadius_ from the PTGs.
      * \return false if they do not support the Reeds-Shepp shot. */
     bool prepare_reeds_shepp_expansion(const TrajectoriesAndRobotShape& trs);
+
+    /** Straight trajectories of C-PTGs used by the spin shot. */
+    RsExpansionPtg spinShotForward_, spinShotReverse_;
+    bool           spinShotAvailable_ = false;
+
+    /** Sets spinShotForward_, spinShotReverse_ and spinShotAvailable_ from the
+     * PTGs. \return false if they do not support the spin shot. */
+    bool prepare_spin_expansion(const TrajectoriesAndRobotShape& trs);
+
+    /** Whether some shot to the goal (Reeds-Shepp or spin) is available. */
+    [[nodiscard]] bool goal_shots_available() const
+    {
+        return rsExpansionRadius_ > 0 || spinShotAvailable_;
+    }
 
     /** For a position goal, the obstacle points near it, relative to the
      * goal point, the final headings at which the footprint, grown by the
@@ -504,6 +658,24 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
         SE2_KinState    stateTo;
     };
 
+    /** The cheapest clear shot from `from` to the goal: Reeds-Shepp
+     * (reeds_shepp_shot()) or spin (spin_shot()), as available. */
+    std::vector<RsShotEdge> goal_shot(
+        const Node& from, const SE2orR2_KinState& goal, double maxLength,
+        bool allHeadings, const TrajectoriesAndRobotShape& trs,
+        const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
+        double MAX_XY_OBSTACLES_CLIPPING_DIST, const PlannerInput& in);
+
+    /** Builds the spin shot from `from` to the goal pose or point as
+     * certified PTG edges (see use_spin_expansion), driving straight no
+     * longer than `maxLength` [m]. \return An empty vector if there is none.
+     */
+    std::vector<RsShotEdge> spin_shot(
+        const Node& from, const SE2orR2_KinState& goal, double maxLength,
+        const TrajectoriesAndRobotShape&                trs,
+        const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
+        double MAX_XY_OBSTACLES_CLIPPING_DIST, const PlannerInput& in);
+
     /** Builds the Reeds-Shepp shot from `from` to the goal pose or point as
      * certified PTG edges (see use_reeds_shepp_expansion), no longer than
      * `maxLength` [m]. For a position goal, the shortest path with a free
@@ -518,7 +690,9 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
         double MAX_XY_OBSTACLES_CLIPPING_DIST, const PlannerInput& in);
 
     /** Executes the Reeds-Shepp `segments` from `from` as certified PTG
-     * edges, which must end at the goal (see reeds_shepp_shot()). */
+     * edges, which must end at the goal (see reeds_shepp_shot()). Segments
+     * of type 'P' are rotations in place by `length` [rad] (see
+     * spin_shot()). */
     std::vector<RsShotEdge> execute_shot(
         const Node& from, const std::vector<ReedsSheppSegment>& segments,
         const SE2orR2_KinState& goal, const TrajectoriesAndRobotShape& trs,
@@ -531,6 +705,77 @@ class TPS_Astar : virtual public mrpt::system::COutputLogger, public Planner
      *  transformed obstacle cloud, avoiding redundant O(N_obs) transforms. */
     std::unordered_map<NodeCoords, mrpt::maps::CPointsMap::Ptr, NodeCoordsHash>
         localObstaclesCache_;
+
+    /** Entry of the open set, ordered by fScore; ties are popped in insertion
+     * order (FIFO). */
+    struct OpenEntry
+    {
+        distance_t fScore;
+        uint64_t   seq;
+        Node*      node;
+        bool       operator>(const OpenEntry& o) const
+        {
+            return fScore != o.fScore ? fScore > o.fScore : seq > o.seq;
+        }
+    };
+    using open_set_t = std::priority_queue<
+        OpenEntry, std::vector<OpenEntry>, std::greater<OpenEntry>>;
+
+    /** State of the search between start() and the end of the search, so it
+     * can be resumed (see run()). */
+    struct SearchState
+    {
+        bool started   = false;
+        bool found     = false;  //!< goal reached
+        bool exhausted = false;  //!< open set empty
+
+        PlannerInput  in;
+        PlannerOutput po;
+
+        std::vector<mrpt::maps::CPointsMap::Ptr> obstaclePoints;
+        double                                   maxXYDist = 0;
+
+        open_set_t            openSet;
+        uint64_t              openSeq    = 0;
+        mrpt::graphs::TNodeID nextFreeId = 0;
+
+        Node*                      nodeGoal = nullptr;
+        NodeCoords                 goalCellIndices;
+        nodes_with_desired_speed_t nodesWithDesiredSpeed;
+
+        unsigned int nIter         = 0;
+        double       tLastCallback = 0;
+
+        /** Deferred analytic expansion: cheapest goal-landing candidate (see
+         * plan()) */
+        Node*  bestGoalCandidate  = nullptr;
+        cost_t bestGoalCandidateG = std::numeric_limits<cost_t>::max();
+        /** A goal candidate may also be the last node of a Reeds-Shepp shot,
+         * which lives in the tree only (not in the lattice) */
+        std::optional<mrpt::graphs::TNodeID> bestGoalCandidateShotId;
+
+        bool deferInterpolation = false;
+    };
+    SearchState search_;
+
+    /** Extracts the obstacle points of search_.in.obstacles, and prepares
+     * everything depending on them. */
+    void prepare_obstacles();
+
+    /** Expands nodes for up to `maxComputationTime` [s] or until the search
+     * ends. */
+    void run_search(duration_seconds_t maxComputationTime);
+
+    /** Completes a copy of the search output: goal shots not committed yet,
+     * deferred edge interpolation, success flag, path cost. */
+    PlannerOutput finalized_output(PlannerOutput po) const;
+
+    /** Builds the deferred interpolated paths of the edges to `nodeId`. */
+    void interpolate_path_to(
+        MotionPrimitivesTreeSE2& tree, mrpt::graphs::TNodeID nodeId) const;
+
+    /** Output ids and costs, with a not yet committed Reeds-Shepp shot. */
+    SliceResult make_slice_result(const PlannerOutput& po) const;
 };
 
 }  // namespace mpp

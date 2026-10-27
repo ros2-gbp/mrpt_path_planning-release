@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 #include <mpp/algos/TrajectoryFollower.h>
 #include <mrpt/core/Clock.h>
+#include <mrpt/math/TPolygon2D.h>
 #include <mrpt/math/wrap2pi.h>
 
 #include <chrono>
@@ -416,6 +417,209 @@ TEST(TrajectoryFollower, BlockedAfterTimeout)
     loc.timestamp = t0 + std::chrono::milliseconds(6000);
     out           = f.step(loc, mkOdo({2.6, 0, 0}, 0));
     EXPECT_EQ(out.status, mpp::FollowerStatus::Blocked);
+}
+
+// The safety speed cap decreases with the distance to a predicted contact, so
+// a robot approaching an obstacle on its path would be commanded ever slower
+// speeds, until they are too small to move a real platform (deadband): it
+// would never stop being commanded to move, nor be reported as Blocked. It
+// must come to a full stop instead, and be reported as Blocked after
+// block_timeout (so that a planner can look for another way).
+TEST(TrajectoryFollower, StopsInsteadOfCrawlingTowardObstacle)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {8, 0}};
+
+    // Returns the status at the end, and when the command became zero:
+    const auto run = [&](double safetyMinSpeed)
+    {
+        mpp::TrajectoryFollower f;
+        f.params.max_speed        = 1.0;
+        f.params.block_timeout    = 2.0;
+        f.params.safety_min_speed = safetyMinSpeed;
+        // (a fine sweep, so contact distances are not rounded down to the
+        // stop distance)
+        f.params.footprint_sample_resolution = 0.01;
+        f.setRobotShape(mpp::robot_radius_t{0.3});
+        f.setObstacles(std::vector<TPoint2D>{{4.0, 0.0}});
+        f.setTrajectory(polyToTraj(pts, 1.0));
+
+        constexpr double kDeadband = 0.03;  // [m/s] the platform does not move
+        const double     dt        = f.params.control_period;
+        const auto       t0        = mrpt::Clock::now();
+        TPose2D          robot     = {0, 0, 0};
+        double           v         = 0;
+        double           tStop     = -1;
+        double           t         = 0;
+        auto             status    = mpp::FollowerStatus::Idle;
+        for (int k = 0; k < static_cast<int>(20.0 / dt); k++)
+        {
+            t        = k * dt;
+            auto loc = mkLoc(robot);
+            loc.timestamp =
+                t0 + std::chrono::microseconds(static_cast<int64_t>(t * 1e6));
+            auto odo       = mkOdo(robot, v);
+            odo.timestamp  = loc.timestamp;
+            const auto out = f.step(loc, odo);
+            status         = out.status;
+            if (status == mpp::FollowerStatus::Blocked) { break; }
+            EXPECT_FALSE(out.command.points.empty());
+            if (out.command.points.empty()) { break; }
+            const auto tw = out.command.points.front().twist;
+            if (tw.vx == 0 && tStop < 0 && robot.x > 1.0) { tStop = t; }
+            // Once stopped, never creeps again:
+            if (tStop >= 0) { EXPECT_EQ(tw.vx, 0.0) << "t=" << t; }
+            v     = std::abs(tw.vx) < kDeadband ? 0.0 : tw.vx;
+            robot = integrate(robot, v, tw.omega, dt);
+        }
+        // Stopped before the stop distance, without touching it:
+        const double gap = 4.0 - 0.3 - robot.x;
+        EXPECT_GT(gap, f.params.stop_distance);
+        return std::make_tuple(status, tStop, t);
+    };
+
+    const auto [status, tStop, tEnd] = run(0.05);
+    EXPECT_EQ(status, mpp::FollowerStatus::Blocked);
+    ASSERT_GE(tStop, 0);
+    EXPECT_NEAR(tEnd - tStop, 2.0, 0.2);  // block_timeout after stopping
+    EXPECT_LT(tStop, 8.0);  // not after a long crawl
+
+    // Without a minimum speed, the deadband would hide the robot is held:
+    const auto [status0, tStop0, tEnd0] = run(0.0);
+    EXPECT_NE(status0, mpp::FollowerStatus::Blocked);
+    EXPECT_LT(tStop0, 0);
+}
+
+// A planner path is a sampled arc: knots every 0.25 m with the true headings
+// of the arc. The curvature commanded on it must be that of the arc, from the
+// very start of the path (a robot starting close to obstacles may not be able
+// to deviate from it) and steadily along it, not depending on where the
+// vehicle is between knots.
+TEST(TrajectoryFollower, TracksSampledArcCurvatureFromTheStart)
+{
+    constexpr double R    = 1.2;  // [m]
+    constexpr double step = 0.25;  // [m] between knots
+    mpp::Trajectory  tr;
+    for (int i = 0; i <= 16; i++)
+    {
+        const double a = i * step / R;
+        tr.emplace_back(
+            TPose2D(R * std::sin(a), R * (1 - std::cos(a)), a), 0.5);
+    }
+    mpp::TrajectoryFollower f;
+    f.params.max_speed = 0.5;
+    f.setTrajectory(tr);
+
+    TPose2D      robot   = tr.front().pose;
+    double       v       = 0;
+    const double dt      = f.params.control_period;
+    double       curvMin = std::numeric_limits<double>::infinity();
+    double       curvMax = -curvMin;
+    for (int k = 0; k < 100; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        ASSERT_FALSE(out.command.points.empty());
+        const auto tw = out.command.points.front().twist;
+        if (std::abs(tw.vx) > 1e-3)
+        {
+            const double curv = tw.omega / tw.vx;
+            if (k == 0 || out.arc_length_s < 2.5)
+            {
+                curvMin = std::min(curvMin, curv);
+                curvMax = std::max(curvMax, curv);
+            }
+        }
+        robot = integrate(robot, tw.vx, tw.omega, dt);
+        v     = tw.vx;
+    }
+    EXPECT_NEAR(curvMin, 1 / R, 0.1);
+    EXPECT_NEAR(curvMax, 1 / R, 0.1);
+}
+
+// An external speed cap (e.g. from a collision guard) slows the vehicle down
+// smoothly; one below safety_min_speed stops it, and it is reported Blocked
+// if held so for block_timeout. It reports the curvature and gear it wants.
+TEST(TrajectoryFollower, ExternalSpeedCap)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {20, 0}};
+    mpp::TrajectoryFollower     f;
+    f.params.max_speed     = 1.0;
+    f.params.block_timeout = 1.0;
+    f.setTrajectory(polyToTraj(pts, 1.0));
+
+    const double dt     = f.params.control_period;
+    const auto   t0     = mrpt::Clock::now();
+    TPose2D      robot  = {0, 0, 0};
+    double       v      = 0;
+    double       prevV  = 0;
+    auto         status = mpp::FollowerStatus::Idle;
+    for (int k = 0; k < static_cast<int>(12.0 / dt); k++)
+    {
+        const double t = k * dt;
+        if (t >= 4.0 && t < 8.0) { f.setSpeedCap(0.3); }
+        else if (t >= 8.0) { f.setSpeedCap(0.02); }
+        auto loc = mkLoc(robot);
+        loc.timestamp =
+            t0 + std::chrono::microseconds(static_cast<int64_t>(t * 1e6));
+        auto odo       = mkOdo(robot, v);
+        odo.timestamp  = loc.timestamp;
+        const auto out = f.step(loc, odo);
+        status         = out.status;
+        if (status == mpp::FollowerStatus::Blocked) { break; }
+        ASSERT_FALSE(out.command.points.empty());
+        EXPECT_EQ(out.gear, 1.0);
+        EXPECT_NEAR(out.curvature, 0.0, 0.05);
+        const auto tw = out.command.points.front().twist;
+        // Never faster than the cap after slowing down to it, and slowing
+        // down at the decel limit (smoothly):
+        if (t > 6.0 && t < 8.0) { EXPECT_LE(tw.vx, 0.3 + 1e-6); }
+        EXPECT_GE(tw.vx, prevV - f.params.max_decel * dt - 1e-6);
+        // (ramping down at max_decel from 0.3 m/s)
+        if (t > 8.6) { EXPECT_EQ(tw.vx, 0.0) << t; }
+        prevV = tw.vx;
+        robot = integrate(robot, tw.vx, tw.omega, dt);
+        v     = tw.vx;
+    }
+    EXPECT_EQ(status, mpp::FollowerStatus::Blocked);
+}
+
+// The external speed cap is a cap on the speed, not a fraction of it: on a
+// curve that already limits the speed below it, it changes nothing.
+TEST(TrajectoryFollower, ExternalSpeedCapIsAbsolute)
+{
+    constexpr double R = 1.0;  // [m]
+    mpp::Trajectory  tr;
+    for (int i = 0; i <= 60; i++)
+    {
+        const double a = i * 0.1 / R;
+        tr.emplace_back(
+            TPose2D(R * std::sin(a), R * (1 - std::cos(a)), a), 1.0);
+    }
+    const auto maxSpeedOnArc = [&](double cap)
+    {
+        mpp::TrajectoryFollower f;
+        f.params.max_speed = 1.0;
+        f.params.max_omega = 0.2;  // => 0.2 m/s on the arc
+        f.setTrajectory(tr);
+        f.setSpeedCap(cap);
+        TPose2D      robot = tr.front().pose;
+        double       v     = 0;
+        double       vMax  = 0;
+        const double dt    = f.params.control_period;
+        for (int k = 0; k < 100; k++)
+        {
+            const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+            if (out.command.points.empty()) { break; }
+            const auto tw = out.command.points.front().twist;
+            vMax          = std::max(vMax, tw.vx);
+            robot         = integrate(robot, tw.vx, tw.omega, dt);
+            v             = tw.vx;
+        }
+        return vMax;
+    };
+    const double vFree = maxSpeedOnArc(std::numeric_limits<double>::infinity());
+    EXPECT_NEAR(vFree, 0.2, 0.02);
+    EXPECT_NEAR(maxSpeedOnArc(0.3), vFree, 1e-6);
+    EXPECT_NEAR(maxSpeedOnArc(0.1), 0.1, 0.01);
 }
 
 TEST(TrajectoryFollower, IgnoresObstacleOffPath)
@@ -1660,4 +1864,878 @@ TEST(TrajectoryFollower, OffPathDebounceSuppressesTransientSpike)
     }
     EXPECT_EQ(out.status, mpp::FollowerStatus::OffPathExceeded)
         << "a sustained deviation must still trip the fault";
+}
+
+TEST(TrajectoryFollower, ExecutesFinalReverseManeuverNearGoal)
+{
+    // Forward 4 m, then back up 0.24 m (body heading kept, i.e. driving in
+    // reverse) to the goal: the cusp is within arrival_radius of the goal,
+    // but the final reverse maneuver must still be executed.
+    mpp::Trajectory tr;
+    for (double x = 0; x <= 4.0 + 1e-9; x += 0.1)
+    {
+        tr.emplace_back(TPose2D(x, 0, 0), 0.5);
+    }
+    const TPose2D goal(3.76, -0.03, 0.0);
+    for (int i = 1; i <= 4; i++)
+    {
+        const double t = i / 4.0;
+        tr.emplace_back(
+            TPose2D(4.0 + t * (goal.x - 4.0), t * goal.y, 0.0), 0.5);
+    }
+
+    mpp::TrajectoryFollower f;
+    f.params.max_speed          = 0.5;
+    f.params.min_lookahead_dist = 0.8;
+    f.params.max_omega          = 1.0;
+    f.setTrajectory(tr);
+
+    std::vector<TPoint2D> pts;
+    for (const auto& p : tr) { pts.emplace_back(p.pose.x, p.pose.y); }
+    const auto r = simulateVerbose(f, {0, 0, 0}, pts, goal);
+    ASSERT_TRUE(r.reached);
+    EXPECT_LT(std::hypot(r.finalPose.x - goal.x, r.finalPose.y - goal.y), 0.15)
+        << "final pose: " << r.finalPose.asString();
+}
+
+namespace
+{
+// 10 m straight, then a left arc of radius 1 m (quarter turn), then straight.
+mpp::Trajectory straightThenCurve()
+{
+    mpp::Trajectory tr;
+    for (double x = 0; x < 10.0; x += 0.1)
+    {
+        tr.emplace_back(TPose2D(x, 0, 0), 0);
+    }
+    for (double a = 0; a <= M_PI / 2 + 1e-9; a += M_PI / 40)
+    {
+        tr.emplace_back(TPose2D(10 + std::sin(a), 1 - std::cos(a), a), 0);
+    }
+    for (double y = 1.1; y < 5.0; y += 0.1)
+    {
+        tr.emplace_back(TPose2D(11, y, M_PI / 2), 0);
+    }
+    return tr;
+}
+
+// Commanded speed when entering the curve (x ~ 10).
+double speedEnteringCurve(bool preview)
+{
+    mpp::TrajectoryFollower f;
+    f.params.max_speed         = 3.0;
+    f.params.max_accel         = 2.0;
+    f.params.max_decel         = 1.0;
+    f.params.max_lateral_accel = 1.0;
+    f.params.curvature_preview = preview;
+    f.setTrajectory(straightThenCurve());
+
+    TPose2D      robot = {0, 0, 0};
+    double       v     = 0;
+    const double dt    = f.params.control_period;
+    for (int k = 0; k < 2000; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        if (out.command.points.empty()) { break; }
+        const auto tw = out.command.points.front().twist;
+        if (robot.x >= 9.95) { return tw.vx; }
+        robot = integrate(robot, tw.vx, tw.omega, dt);
+        v     = tw.vx;
+    }
+    return -1;
+}
+}  // namespace
+
+TEST(TrajectoryFollower, CurvaturePreviewSlowsDownBeforeCurves)
+{
+    const double vWith    = speedEnteringCurve(true);
+    const double vWithout = speedEnteringCurve(false);
+    // Lateral accel limit on R=1 m: v = sqrt(1.0 * 1) = 1 m/s (plus a margin,
+    // since the curvature is estimated over a window around each point):
+    EXPECT_GT(vWith, 0.5);
+    EXPECT_LT(vWith, 1.4);
+    EXPECT_GT(vWithout, 2.0) << "the test is only meaningful if, without "
+                                "preview, the curve is entered fast";
+}
+
+namespace
+{
+// Final distance past the goal of a straight 8 m path, driven by a platform
+// whose speed follows the command as a first-order lag of time constant tau.
+double overshootWithLaggedPlatform(double tau, double actuationLagParam)
+{
+    std::vector<TPoint2D> pts;
+    for (double x = 0; x <= 8.0 + 1e-9; x += 0.1) { pts.emplace_back(x, 0); }
+
+    mpp::TrajectoryFollower f;
+    f.params.max_speed     = 2.0;
+    f.params.max_accel     = 0.5;
+    f.params.max_decel     = 0.5;
+    f.params.actuation_lag = actuationLagParam;
+    f.setTrajectory(polyToTraj(pts, 0));
+
+    TPose2D      robot = {0, 0, 0};
+    double       vAct  = 0;
+    double       vCmd  = 0;
+    bool         done  = false;
+    const double dt    = f.params.control_period;
+    for (int k = 0; k < 4000; k++)
+    {
+        if (!done)
+        {
+            const auto out = f.step(mkLoc(robot), mkOdo(robot, vAct));
+            done           = out.status == mpp::FollowerStatus::ReachedGoal;
+            vCmd           = done || out.command.points.empty()
+                                 ? 0.0
+                                 : out.command.points.front().twist.vx;
+        }
+        vAct += (vCmd - vAct) * dt / tau;
+        robot = integrate(robot, vAct, 0, dt);
+        if (done && std::abs(vAct) < 1e-3) { break; }
+    }
+    return robot.x - 8.0;
+}
+}  // namespace
+
+TEST(TrajectoryFollower, ActuationLagAvoidsOvershootingTheGoal)
+{
+    const double tau = 0.7;
+    EXPECT_LT(std::abs(overshootWithLaggedPlatform(tau, tau)), 0.25);
+    EXPECT_GT(overshootWithLaggedPlatform(tau, 0.0), 0.5)
+        << "the test is only meaningful if the lag causes an overshoot";
+}
+
+TEST(TrajectoryFollower, NearDuplicateFinalPointIsNotACusp)
+{
+    // A path ending in reverse, whose final point is (almost) duplicated, as
+    // when a planner appends the exact goal after its last path sample: the
+    // tiny last segment must not be taken for a cusp switching to forward.
+    mpp::Trajectory tr;
+    for (double x = 0; x <= 3.0 + 1e-9; x += 0.1)
+    {
+        tr.emplace_back(TPose2D(x, 0, 0), 0.5);
+    }
+    for (int i = 1; i <= 10; i++)  // back up 1 m
+    {
+        tr.emplace_back(TPose2D(3.0 - 0.1 * i, 0, 0), 0.5);
+    }
+    tr.emplace_back(TPose2D(2.0 - 0.0005, 0.0005, 0), 0.5);  // ~1 mm
+
+    mpp::TrajectoryFollower f;
+    f.params.max_speed          = 0.5;
+    f.params.min_lookahead_dist = 0.8;
+    f.setTrajectory(tr);
+
+    std::vector<TPoint2D> pts;
+    for (const auto& p : tr) { pts.emplace_back(p.pose.x, p.pose.y); }
+    const auto r = simulate(f, {0, 0, 0}, pts, 4000);
+    ASSERT_TRUE(r.reached);
+    EXPECT_LT(std::hypot(r.finalPose.x - 2.0, r.finalPose.y), 0.15)
+        << "final pose: " << r.finalPose.asString();
+}
+
+TEST(TrajectoryFollower, ReferenceSweepUsesBodyHeadingWhenReversing)
+{
+    // A car-like footprint, very asymmetric around its origin (rear axle),
+    // backs up 3 m to a goal 0.35 m in front of a wall behind it. Sweeping the
+    // footprint along the path tangent (heading flipped on reverse segments)
+    // would wrongly put its front into the wall.
+    mpp::Trajectory tr;
+    for (int i = 0; i <= 30; i++)
+    {
+        tr.emplace_back(TPose2D(3.0 - 0.1 * i, 0, 0), 0.5);  // reverse
+    }
+
+    mrpt::math::TPolygon2D shape;
+    shape.emplace_back(-0.3, -0.5);
+    shape.emplace_back(1.8, -0.5);
+    shape.emplace_back(1.8, 0.5);
+    shape.emplace_back(-0.3, 0.5);
+
+    std::vector<TPoint2D> wall;
+    for (double y = -2.0; y <= 2.0; y += 0.05) { wall.emplace_back(-0.65, y); }
+
+    mpp::TrajectoryFollower f;
+    f.params.max_speed          = 0.5;
+    f.params.min_lookahead_dist = 0.8;
+    f.setRobotShape(shape);
+    f.setObstacles(wall);
+    f.setTrajectory(tr);
+
+    std::vector<TPoint2D> pts;
+    for (const auto& p : tr) { pts.emplace_back(p.pose.x, p.pose.y); }
+    const auto r = simulate(f, {3.0, 0, 0}, pts, 4000);
+    EXPECT_TRUE(r.reached) << "final pose: " << r.finalPose.asString();
+    EXPECT_LT(std::abs(r.finalPose.x), 0.2);
+}
+
+// When the robot settles at its closest approach to the goal with a large
+// heading error (here, a final heading the path does not lead to), it reports
+// ReachedGoal by default, or MissedGoal if `arrival_ang_tol` is set.
+TEST(TrajectoryFollower, ArrivalHeadingToleranceReportsMissedGoal)
+{
+    const std::vector<TPoint2D> pts  = {{0, 0}, {5, 0}};
+    auto                        traj = polyToTraj(pts, 0.5);
+    traj.back().pose.phi             = mrpt::DEG2RAD(60.0);
+
+    const auto finalStatus = [&](double arrivalAngTolDeg)
+    {
+        mpp::TrajectoryFollower f;
+        f.params.arrival_ang_tol = mrpt::DEG2RAD(arrivalAngTolDeg);
+        f.setTrajectory(traj);
+        TPose2D             robot(0, 0, 0);
+        double              v      = 0;
+        mpp::FollowerStatus status = mpp::FollowerStatus::Idle;
+        for (int k = 0; k < 2000; k++)
+        {
+            const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+            status         = out.status;
+            if (status != mpp::FollowerStatus::Running) { break; }
+            v = 0;
+            if (!out.command.points.empty())
+            {
+                const auto tw = out.command.points.front().twist;
+                robot =
+                    integrate(robot, tw.vx, tw.omega, f.params.control_period);
+                v = tw.vx;
+            }
+        }
+        return status;
+    };
+
+    EXPECT_EQ(finalStatus(0.0), mpp::FollowerStatus::ReachedGoal);
+    EXPECT_EQ(finalStatus(30.0), mpp::FollowerStatus::MissedGoal);
+}
+
+// A robot passing the goal to one side, farther than `arrival_radius` (here,
+// one whose steering has no effect), must stop shortly after passing the path
+// end and report MissedGoal, instead of driving away until it is off path.
+TEST(TrajectoryFollower, PassingTheGoalToOneSideReportsMissedGoal)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {5, 0}};
+    mpp::TrajectoryFollower     f;
+    f.params.arrival_radius  = 0.3;
+    f.params.max_cross_track = 1.0;
+    f.setTrajectory(polyToTraj(pts, 0.5));
+
+    TPose2D             robot(0, 0.4, 0);
+    double              v      = 0;
+    mpp::FollowerStatus status = mpp::FollowerStatus::Idle;
+    for (int k = 0; k < 2000; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        status         = out.status;
+        if (status != mpp::FollowerStatus::Running) { break; }
+        v = 0;
+        if (!out.command.points.empty())
+        {
+            v     = out.command.points.front().twist.vx;
+            robot = integrate(robot, v, 0, f.params.control_period);
+        }
+    }
+    EXPECT_EQ(status, mpp::FollowerStatus::MissedGoal);
+    EXPECT_GT(robot.x, 5.0);
+    EXPECT_LT(robot.x, 5.3);
+}
+
+// A planner may leave a back-and-forth spike of a few centimeters where two
+// path edges join: it must not be taken for two cusps (stop, reverse a little,
+// go forward again).
+namespace
+{
+// Drives a car-like vehicle along a straight path up to 1.5 m, then the given
+// spike knots, then on to 4 m.
+void expectSpikeIgnored(const std::vector<double>& spikeXs)
+{
+    std::vector<TPoint2D> pts;
+    for (double x = 0; x <= 1.5 + 1e-9; x += 0.25) { pts.emplace_back(x, 0); }
+    for (const double x : spikeXs) { pts.emplace_back(x, 0); }
+    for (double x = 1.75; x <= 4.0 + 1e-9; x += 0.25)
+    {
+        pts.emplace_back(x, 0);
+    }
+
+    mpp::Trajectory tr;
+    for (const auto& p : pts) { tr.emplace_back(TPose2D(p.x, p.y, 0.0), 0.0); }
+
+    mpp::TrajectoryFollower f;
+    f.params.min_turn_radius = 2.25;  // car-like
+    f.setTrajectory(tr);
+
+    TPose2D robot = {0, 0, 0};
+    double  v     = 0;
+    double  minV  = 0;
+    bool    done  = false;
+    for (int k = 0; k < 2000 && !done; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        done           = out.status == mpp::FollowerStatus::ReachedGoal;
+        if (done || out.command.points.empty()) { break; }
+        const auto tw = out.command.points.front().twist;
+        minV          = std::min(minV, tw.vx);
+        robot = integrate(robot, tw.vx, tw.omega, f.params.control_period);
+        v     = tw.vx;
+    }
+    EXPECT_TRUE(done);
+    EXPECT_GT(minV, -1e-3) << "commanded a reverse motion";
+    EXPECT_NEAR(robot.x, 4.0, 0.2);
+}
+}  // namespace
+
+TEST(TrajectoryFollower, CentimeterBackAndForthLegIsIgnored)
+{
+    expectSpikeIgnored({1.46});  // 4 cm back
+    expectSpikeIgnored({1.46, 1.499});  // 4 cm back, then just short of 1.5
+}
+
+// ---------------------------------------------------------------------------
+// Curve exits. Geometric maneuvers made of straights and arcs, sampled at the
+// knot pitch of a waypoint generator (a dozen knots per arc), with the
+// accuracy-tuned parameters: backing into a narrow aisle (reverse straight,
+// 90 deg arc, short straight to the goal) and a forward quarter-ellipse turn.
+// The vehicle must leave each arc on the following straight, not wide of it:
+// the clearance left in such an aisle is a couple of decimeters per side.
+namespace
+{
+struct PathSample
+{
+    std::vector<XYYawDeg> knots;
+    // Arc-length span of the last straight, to measure the curve-exit error
+    // on it alone.
+    std::vector<TPoint2D> lastStraight;
+};
+
+// Straight of length l0 along +x, left arc of radius r through 90 deg, and
+// straight of length l1 along +y. Body headings follow the travel tangent,
+// flipped by 180 deg in reverse.
+PathSample straightArcStraight(
+    double l0, double r, double l1, bool reverse, int nStraight0 = 6,
+    int nArc = 12, int nStraight1 = 3)
+{
+    PathSample   ps;
+    const double flip = reverse ? 180.0 : 0.0;
+    for (int i = 0; i <= nStraight0; i++)
+    {
+        ps.knots.push_back({l0 * i / nStraight0, 0.0, flip});
+    }
+    for (int i = 1; i <= nArc; i++)
+    {
+        const double t = (M_PI / 2) * i / nArc;
+        ps.knots.push_back(
+            {l0 + r * std::sin(t), r - r * std::cos(t),
+             mrpt::RAD2DEG(t) + flip});
+    }
+    for (int i = 1; i <= nStraight1; i++)
+    {
+        ps.knots.push_back({l0 + r, r + l1 * i / nStraight1, 90.0 + flip});
+    }
+    ps.lastStraight = {{l0 + r, r}, {l0 + r, r + l1}};
+    return ps;
+}
+
+// Forward quarter-ellipse turn (semi-axes a along +x, b along +y, ending
+// heading +y), then a straight of length l1.
+PathSample quarterEllipseStraight(double a, double b, double l1)
+{
+    PathSample ps;
+    ps.knots.push_back({0.0, 0.0, 0.0});
+    for (int i = 1; i <= 12; i++)
+    {
+        const double t = (M_PI / 2) * i / 12;
+        ps.knots.push_back(
+            {a * std::sin(t), b * (1 - std::cos(t)),
+             mrpt::RAD2DEG(std::atan2(b * std::sin(t), a * std::cos(t)))});
+    }
+    for (int i = 1; i <= 3; i++)
+    {
+        ps.knots.push_back({a, b + l1 * i / 3, 90.0});
+    }
+    ps.lastStraight = {{a, b}, {a, b + l1}};
+    return ps;
+}
+
+struct CurveExitResult
+{
+    bool   reached      = false;
+    double maxCross     = 0;  //!< over the whole path
+    double maxCrossLast = 0;  //!< on the last straight only
+};
+
+CurveExitResult runCurveExit(const PathSample& ps, double speed)
+{
+    mpp::TrajectoryFollower f;
+    applyAccuracyTunedParams(f);
+    f.setTrajectory(mkTrajFromRecorded(ps.knots, speed));
+
+    const auto&     k0 = ps.knots.front();
+    TPose2D         robot(k0.x, k0.y, mrpt::DEG2RAD(k0.yaw_deg));
+    double          v = 0;
+    CurveExitResult res;
+    const auto      pts   = xyOf(ps.knots);
+    const TPoint2D& ls0   = ps.lastStraight.front();
+    const TPoint2D& ls1   = ps.lastStraight.back();
+    const double    lsLen = std::hypot(ls1.x - ls0.x, ls1.y - ls0.y);
+    for (int k = 0; k < 8000; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        res.maxCross =
+            std::max(res.maxCross, distToPolyline(pts, {robot.x, robot.y}));
+        // Along-track position on the last straight: only count it once the
+        // vehicle is abreast of that segment.
+        const double along = ((robot.x - ls0.x) * (ls1.x - ls0.x) +
+                              (robot.y - ls0.y) * (ls1.y - ls0.y)) /
+                             lsLen;
+        if (along > 0)
+        {
+            res.maxCrossLast = std::max(
+                res.maxCrossLast,
+                distToPolyline(ps.lastStraight, {robot.x, robot.y}));
+        }
+        if (out.status == mpp::FollowerStatus::ReachedGoal)
+        {
+            res.reached = true;
+            break;
+        }
+        if (out.command.points.empty()) { break; }
+        const auto tw = out.command.points.front().twist;
+        robot = integrate(robot, tw.vx, tw.omega, f.params.control_period);
+        v     = tw.vx;
+    }
+    fprintf(
+        stderr, "[curve-exit] reached=%d maxCross=%.3f maxCrossLast=%.3f\n",
+        res.reached, res.maxCross, res.maxCrossLast);
+    return res;
+}
+}  // namespace
+
+// Backing into a narrow aisle: 2.8 m reverse straight, R = 1.24 m arc and a
+// 1.45 m straight to the goal.
+TEST(TrajectoryFollower, CurveExitReverseIntoAisle)
+{
+    const auto r =
+        runCurveExit(straightArcStraight(2.8, 1.24, 1.45, true), 0.3);
+    EXPECT_TRUE(r.reached);
+    EXPECT_LT(r.maxCrossLast, 0.06);
+}
+
+// Same maneuver with a tighter arc (R = 0.7 m).
+TEST(TrajectoryFollower, CurveExitReverseIntoAisleTightArc)
+{
+    const auto r = runCurveExit(straightArcStraight(3.3, 0.7, 1.45, true), 0.3);
+    EXPECT_TRUE(r.reached);
+    EXPECT_LT(r.maxCrossLast, 0.06);
+}
+
+// Forward quarter-ellipse turn (a = 2.0 m, b = 1.8 m) and a 0.45 m straight.
+TEST(TrajectoryFollower, CurveExitForwardQuarterEllipse)
+{
+    const auto r = runCurveExit(quarterEllipseStraight(2.0, 1.8, 0.45), 0.3);
+    EXPECT_TRUE(r.reached);
+    EXPECT_LT(r.maxCross, 0.05);
+}
+
+// ---------------------------------------------------------------------------
+// Path updates, reset, point-cloud obstacles, rotate_at_goal
+// ---------------------------------------------------------------------------
+
+TEST(TrajectoryFollower, PathUpdatesDoNotResetBlockedTimer)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {6, 0}};
+    mpp::TrajectoryFollower     f;
+    f.params.block_timeout = 5.0;
+    f.setRobotShape(mpp::robot_radius_t{0.3});
+    f.setObstacles(std::vector<TPoint2D>{{3.0, 0.0}});
+    f.setTrajectory(polyToTraj(pts, 0.5));
+
+    const auto t0  = mrpt::Clock::now();
+    const auto pos = TPose2D(2.6, 0, 0);
+
+    mpp::FollowerStatus status = mpp::FollowerStatus::Idle;
+    for (int i = 0; i <= 8; i++)
+    {
+        // A path update once a second, as a replanner would do:
+        f.updateTrajectory(polyToTraj(pts, 0.5));
+
+        auto loc       = mkLoc(pos);
+        loc.timestamp  = t0 + std::chrono::milliseconds(1000 * i);
+        const auto out = f.step(loc, mkOdo(pos, 0));
+        EXPECT_EQ(out.safety_scale, 0.0);
+        status = out.status;
+        if (i < 5) { EXPECT_NE(status, mpp::FollowerStatus::Blocked) << i; }
+    }
+    EXPECT_EQ(status, mpp::FollowerStatus::Blocked);
+}
+
+TEST(TrajectoryFollower, ResetDropsTrajectory)
+{
+    mpp::TrajectoryFollower f;
+    f.setTrajectory(polyToTraj({{0, 0}, {3, 0}}, 0.5));
+    ASSERT_TRUE(f.hasTrajectory());
+    f.reset();
+    EXPECT_FALSE(f.hasTrajectory());
+    const auto out = f.step(mkLoc({0, 0, 0}), mkOdo({0, 0, 0}, 0));
+    EXPECT_EQ(out.status, mpp::FollowerStatus::Idle);
+}
+
+TEST(TrajectoryFollower, SetObstaclesFromPointsMap)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {6, 0}};
+    mpp::TrajectoryFollower     f;
+    f.setRobotShape(mpp::robot_radius_t{0.3});
+
+    mrpt::maps::CSimplePointsMap obs;
+    obs.insertPoint(3.0f, 0.0f, 0.0f);
+    f.setObstacles(obs);
+    f.setTrajectory(polyToTraj(pts, 0.5));
+
+    const auto out = f.step(mkLoc({2.6, 0, 0}), mkOdo({2.6, 0, 0}, 0));
+    EXPECT_EQ(out.safety_scale, 0.0);
+
+    f.setObstacles(mrpt::maps::CSimplePointsMap());
+    const auto out2 = f.step(mkLoc({2.6, 0, 0}), mkOdo({2.6, 0, 0}, 0));
+    EXPECT_GT(out2.safety_scale, 0.0);
+}
+
+TEST(TrajectoryFollower, RotatesInPlaceToGoalHeading)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}};
+    auto                        tr  = polyToTraj(pts, 0.5);
+    tr.back().pose.phi              = M_PI / 2;  // goal heading differs
+
+    mpp::TrajectoryFollower f;
+    f.params.rotate_at_goal  = true;
+    f.params.min_turn_radius = 0;
+    f.setTrajectory(tr);
+
+    TPose2D      robot(0, 0, 0);
+    double       v  = 0;
+    bool         ok = false;
+    const double dt = f.params.control_period;
+    for (int k = 0; k < 4000 && !ok; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        if (out.status == mpp::FollowerStatus::ReachedGoal)
+        {
+            ok = true;
+            break;
+        }
+        if (out.command.points.empty()) { break; }
+        const auto tw = out.command.points.front().twist;
+        robot         = integrate(robot, tw.vx, tw.omega, dt);
+        v             = tw.vx;
+    }
+    EXPECT_TRUE(ok);
+    EXPECT_NEAR(std::hypot(robot.x - 2.0, robot.y), 0.0, 0.2);
+    EXPECT_NEAR(mrpt::math::wrapToPi(robot.phi - M_PI / 2), 0.0, 0.15);
+}
+
+// With rotate_at_goal, ReachedGoal must be terminal too: moving the robot away
+// from the goal heading afterwards (e.g. driven by a gamepad) must not make the
+// follower rotate it back.
+TEST(TrajectoryFollower, ReachedGoalLatchesWithRotateAtGoal)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}};
+    mpp::TrajectoryFollower     f;
+    f.params.rotate_at_goal  = true;
+    f.params.min_turn_radius = 0;
+    f.setTrajectory(polyToTraj(pts, 0.5));
+
+    TPose2D      robot(0, 0, 0);
+    double       v       = 0;
+    bool         reached = false;
+    const double dt      = f.params.control_period;
+    for (int k = 0; k < 4000; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        if (out.status == mpp::FollowerStatus::ReachedGoal)
+        {
+            reached = true;
+            break;
+        }
+        ASSERT_FALSE(out.command.points.empty());
+        const auto tw = out.command.points.front().twist;
+        robot         = integrate(robot, tw.vx, tw.omega, dt);
+        v             = tw.vx;
+    }
+    ASSERT_TRUE(reached);
+
+    // Turned at the goal, then backed up and turned further:
+    for (int k = 0; k < 200; k++)
+    {
+        robot.phi = mrpt::math::wrapToPi(robot.phi + mrpt::DEG2RAD(1.0));
+        if (k > 100) { robot.x -= 0.01; }
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, 0));
+        EXPECT_EQ(out.status, mpp::FollowerStatus::ReachedGoal)
+            << "follower re-awakened on a completed path at k=" << k;
+        EXPECT_TRUE(out.command.points.empty())
+            << "follower emitted a motion command after ReachedGoal at k=" << k;
+    }
+
+    // An update after completion re-arms the follower, from where the robot is
+    // now (the old goal also lies on the new path).
+    robot.phi = 0;
+    f.updateTrajectory(polyToTraj({{robot.x, 0}, {robot.x + 2, 0}}, 0.5));
+    const auto out = f.step(mkLoc(robot), mkOdo(robot, 0));
+    EXPECT_NE(out.status, mpp::FollowerStatus::ReachedGoal);
+    EXPECT_LT(out.arc_length_s, 0.2);
+}
+
+// ---------------------------------------------------------------------------
+// Pivots: rotations in place along the path
+// ---------------------------------------------------------------------------
+namespace
+{
+// Straight segments between points, with a rotation in place (knots every 10
+// degrees, in the direction of `turn`) at each interior point.
+mpp::Trajectory pivotPath(
+    const std::vector<TPoint2D>& pts, const std::vector<double>& turns,
+    double phi0 = 0)
+{
+    mpp::Trajectory tr;
+    double          phi = phi0;
+    for (std::size_t i = 0; i + 1 < pts.size(); i++)
+    {
+        if (i > 0)
+        {
+            const double turn = turns.at(i - 1);
+            const int    n    = static_cast<int>(
+                std::ceil(std::abs(turn) / mrpt::DEG2RAD(10.0)));
+            for (int j = 1; j <= n; j++)
+            {
+                tr.emplace_back(
+                    TPose2D(
+                        pts[i].x, pts[i].y,
+                        mrpt::math::wrapToPi(phi + turn * j / n)),
+                    0.5);
+            }
+            phi += turn;
+        }
+        const double len =
+            std::hypot(pts[i + 1].x - pts[i].x, pts[i + 1].y - pts[i].y);
+        const int n = static_cast<int>(std::ceil(len / 0.1));
+        for (int j = (i == 0 ? 0 : 1); j <= n; j++)
+        {
+            const double t = double(j) / n;
+            tr.emplace_back(
+                TPose2D(
+                    pts[i].x + t * (pts[i + 1].x - pts[i].x),
+                    pts[i].y + t * (pts[i + 1].y - pts[i].y),
+                    mrpt::math::wrapToPi(phi)),
+                0.5);
+        }
+    }
+    return tr;
+}
+
+struct PivotRun
+{
+    bool                reached    = false;
+    mpp::FollowerStatus lastStatus = mpp::FollowerStatus::Idle;
+    TPose2D             finalPose;
+    double              maxCross = 0;
+    /** Rotations in place commanded: (position, omega) */
+    std::vector<std::pair<TPoint2D, double>> inPlace;
+};
+
+PivotRun runPivots(
+    mpp::TrajectoryFollower& f, const TPose2D& start,
+    const std::vector<TPoint2D>& pathPts, int maxSteps = 4000)
+{
+    PivotRun     r;
+    TPose2D      robot = start;
+    double       v     = 0;
+    const double dt    = f.params.control_period;
+    const auto   t0    = mrpt::Clock::now();
+    for (int k = 0; k < maxSteps; k++)
+    {
+        auto loc = mkLoc(robot);
+        loc.timestamp =
+            mrpt::Clock::fromDouble(mrpt::Clock::toDouble(t0) + k * dt);
+        const auto out = f.step(loc, mkOdo(robot, v));
+        r.lastStatus   = out.status;
+        r.maxCross =
+            std::max(r.maxCross, distToPolyline(pathPts, {robot.x, robot.y}));
+        if (out.status == mpp::FollowerStatus::ReachedGoal)
+        {
+            r.reached = true;
+            break;
+        }
+        if (out.status != mpp::FollowerStatus::Running ||
+            out.command.points.empty())
+        {
+            break;
+        }
+        const auto tw = out.command.points.front().twist;
+        if (tw.vx == 0 && std::abs(tw.omega) > 1e-3)
+        {
+            r.inPlace.emplace_back(TPoint2D(robot.x, robot.y), tw.omega);
+        }
+        robot = integrate(robot, tw.vx, tw.omega, dt);
+        v     = tw.vx;
+    }
+    r.finalPose = robot;
+    return r;
+}
+}  // namespace
+
+// A 90 deg rotation in place at a corner: the robot stops at it, rotates
+// there, and does not cut the corner.
+TEST(TrajectoryFollower, PivotsAtCorner)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}, {2, 2}};
+    mpp::TrajectoryFollower     f;
+    f.setTrajectory(pivotPath(pts, {M_PI / 2}));
+    ASSERT_TRUE(f.hasTrajectory());
+
+    const auto r = runPivots(f, {0, 0, 0}, pts);
+    EXPECT_TRUE(r.reached);
+    EXPECT_LT(r.maxCross, 0.03);
+    ASSERT_FALSE(r.inPlace.empty());
+    for (const auto& [p, w] : r.inPlace)
+    {
+        EXPECT_LT(std::hypot(p.x - 2.0, p.y), 0.05);
+        EXPECT_GT(w, 0.0);  // left, as planned
+    }
+    EXPECT_NEAR(r.finalPose.x, 2.0, 0.1);
+    EXPECT_NEAR(r.finalPose.y, 2.0, 0.16);
+}
+
+// Turning back by rotating in place: in the planned direction, even if the
+// other is as short.
+TEST(TrajectoryFollower, PivotsBackInThePlannedDirection)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}, {0, 0}};
+    for (const double turn : {M_PI, -M_PI})
+    {
+        mpp::TrajectoryFollower f;
+        f.setTrajectory(pivotPath(pts, {turn}));
+        const auto r = runPivots(f, {0, 0, 0}, pts);
+        EXPECT_TRUE(r.reached) << turn;
+        EXPECT_LT(r.maxCross, 0.03) << turn;
+        ASSERT_FALSE(r.inPlace.empty()) << turn;
+        for (const auto& [p, w] : r.inPlace) { EXPECT_GT(w * turn, 0.0); }
+        EXPECT_LT(std::hypot(r.finalPose.x, r.finalPose.y), 0.16);
+    }
+}
+
+// A rotation at the end of the path is executed, also without
+// rotate_at_goal; and a path that is only a rotation, too.
+TEST(TrajectoryFollower, PivotsAtGoalAndRotationOnlyPaths)
+{
+    {
+        const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}};
+        auto                        tr  = pivotPath(pts, {});
+        for (int j = 1; j <= 9; j++)
+        {
+            tr.emplace_back(TPose2D(2, 0, mrpt::DEG2RAD(-10.0 * j)), 0.5);
+        }
+        mpp::TrajectoryFollower f;
+        f.params.rotate_at_goal = false;
+        f.setTrajectory(tr);
+        const auto r = runPivots(f, {0, 0, 0}, pts);
+        EXPECT_TRUE(r.reached);
+        EXPECT_NEAR(
+            mrpt::math::angDistance(r.finalPose.phi, -M_PI / 2), 0.0, 0.1);
+    }
+    {
+        mpp::Trajectory tr;
+        for (int j = 0; j <= 9; j++)
+        {
+            tr.emplace_back(TPose2D(1, 1, mrpt::DEG2RAD(10.0 * j)), 0.5);
+        }
+        mpp::TrajectoryFollower f;
+        f.setTrajectory(tr);
+        ASSERT_TRUE(f.hasTrajectory());
+        const auto r = runPivots(f, {1, 1, 0}, {{1, 1}, {1, 1}});
+        EXPECT_TRUE(r.reached);
+        EXPECT_NEAR(
+            mrpt::math::angDistance(r.finalPose.phi, M_PI / 2), 0.0, 0.1);
+        EXPECT_NEAR(r.finalPose.x, 1.0, 1e-9);
+        EXPECT_NEAR(r.finalPose.y, 1.0, 1e-9);
+    }
+}
+
+// An obstacle within the footprint rotation circle: the robot waits at the
+// pivot, without rotating, and reports it blocked.
+TEST(TrajectoryFollower, PivotBlockedByObstacle)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}, {2, 2}};
+    mpp::TrajectoryFollower     f;
+    f.params.block_timeout = 1.0;
+    mrpt::math::TPolygon2D shape;
+    shape.emplace_back(-0.20, -0.18);
+    shape.emplace_back(0.30, -0.18);
+    shape.emplace_back(0.30, 0.18);
+    shape.emplace_back(-0.20, 0.18);
+    f.setRobotShape(shape);
+    // Beside the robot at the pivot, 0.12 m from its side (the corners swing
+    // 0.35 m away from the rotation center):
+    f.setObstacles(std::vector<TPoint2D>{{2.0, 0.30}});
+    f.setTrajectory(pivotPath(pts, {M_PI / 2}));
+
+    const auto r = runPivots(f, {0, 0, 0}, pts);
+    EXPECT_FALSE(r.reached);
+    EXPECT_EQ(r.lastStatus, mpp::FollowerStatus::Blocked);
+    EXPECT_TRUE(r.inPlace.empty());
+    EXPECT_NEAR(r.finalPose.x, 2.0, 0.05);
+    EXPECT_NEAR(r.finalPose.phi, 0.0, 0.05);
+}
+
+// Pivots are merged with the path for car-like vehicles, or if disabled.
+TEST(TrajectoryFollower, NoPivotsIfDisabledOrCarLike)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {3, 0}, {3, 3}};
+    for (const bool carLike : {false, true})
+    {
+        mpp::TrajectoryFollower f;
+        if (carLike) { f.params.min_turn_radius = 0.5; }
+        else { f.params.pivot_in_place = false; }
+        f.setTrajectory(pivotPath(pts, {M_PI / 2}));
+        const auto r = runPivots(f, {0, 0, 0}, pts);
+        EXPECT_TRUE(r.inPlace.empty()) << carLike;
+    }
+}
+
+// A path update while rotating at a pivot goes on with that rotation.
+TEST(TrajectoryFollower, PathUpdateWhilePivoting)
+{
+    const std::vector<TPoint2D> pts = {{0, 0}, {2, 0}, {2, 2}};
+    const auto                  tr  = pivotPath(pts, {M_PI / 2});
+    mpp::TrajectoryFollower     f;
+    f.setTrajectory(tr);
+
+    // While rotating, update with the same path, a few times:
+    int          nUpdates = 0;
+    TPose2D      robot(0, 0, 0);
+    double       v       = 0;
+    const double dt      = f.params.control_period;
+    bool         reached = false;
+    for (int k = 0; k < 4000; k++)
+    {
+        const auto out = f.step(mkLoc(robot), mkOdo(robot, v));
+        if (out.status == mpp::FollowerStatus::ReachedGoal)
+        {
+            reached = true;
+            break;
+        }
+        ASSERT_EQ(out.status, mpp::FollowerStatus::Running);
+        ASSERT_FALSE(out.command.points.empty());
+        const auto tw = out.command.points.front().twist;
+        if (tw.vx == 0 && std::abs(tw.omega) > 1e-3 && nUpdates < 5)
+        {
+            f.updateTrajectory(tr);
+            nUpdates++;
+            // Still rotating, not driving (forward or backward):
+            const auto o2 = f.step(mkLoc(robot), mkOdo(robot, v));
+            ASSERT_FALSE(o2.command.points.empty());
+            EXPECT_EQ(o2.command.points.front().twist.vx, 0.0);
+            EXPECT_GT(o2.command.points.front().twist.omega, 0.0);
+        }
+        robot = integrate(robot, tw.vx, tw.omega, dt);
+        v     = tw.vx;
+    }
+    EXPECT_TRUE(reached);
+    EXPECT_EQ(nUpdates, 5);
+    EXPECT_NEAR(robot.x, 2.0, 0.1);
+    EXPECT_NEAR(robot.y, 2.0, 0.16);
 }

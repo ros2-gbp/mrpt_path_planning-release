@@ -15,12 +15,15 @@
 #include <mrpt/serialization/CArchive.h>
 #include <mrpt/serialization/stl_serialization.h>
 #include <mrpt/system/CTicTac.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <utility>
 
 using namespace mpp::ptg;
@@ -127,7 +130,7 @@ double boxPolygonDistance(const Box2D& box, const mrpt::math::TPolygon2D& poly)
  *   - v_max, w_max: Maximum robot speeds.
  */
 DiffDriveCollisionGridBased::DiffDriveCollisionGridBased()
-    : m_collisionGrid(-1, 1, -1, 1, 0.5, this)
+    : m_collisionGrid(-1, 1, -1, 1, 0.5)
 {
 }
 
@@ -236,7 +239,8 @@ void DiffDriveCollisionGridBased::simulateTrajectories(
         points.push_back(TCPoint(x, y, phi, t, dist, v, w));
 
         // Simulate until...
-        while (t < max_time && dist < max_dist && fabs(turned) < 1.95 * M_PI)
+        while (t < max_time && dist < max_dist && fabs(turned) < 1.95 * M_PI &&
+               !ptgDiffDriveTrajectoryEnded(alpha, t, x, y, phi))
         {
             // Compute new movement command (v,w):
             ptgDiffDriveSteeringFunction(alpha, t, x, y, phi, v, w);
@@ -369,18 +373,37 @@ bool DiffDriveCollisionGridBased::saveColGridsToFile(
     const std::string&          filename,
     const mrpt::math::CPolygon& computed_robotShape) const
 {
+    // Write to a temporary file and rename it, so concurrent readers never
+    // see a partially written cache file:
+    const std::string tmpName = filename + ".tmp" +
+                                std::to_string(std::hash<std::thread::id>()(
+                                    std::this_thread::get_id())) +
+                                "_" + std::to_string(::getpid());
     try
     {
-        mrpt::io::CFileGZOutputStream fo(filename);
-        if (!fo.fileOpenCorrectly()) return false;
+        bool ok = false;
+        {
+            mrpt::io::CFileGZOutputStream fo(tmpName);
+            if (!fo.fileOpenCorrectly()) { return false; }
 
-        const uint32_t n    = 1;  // for backwards compatibility...
-        auto           arch = mrpt::serialization::archiveFrom(fo);
-        arch << n;
-        return m_collisionGrid.saveToFile(&arch, computed_robotShape);
+            const uint32_t n    = 1;  // for backwards compatibility...
+            auto           arch = mrpt::serialization::archiveFrom(fo);
+            arch << n;
+            ok = m_collisionGrid.saveToFile(*this, &arch, computed_robotShape);
+        }
+        std::error_code ec;
+        if (ok) { std::filesystem::rename(tmpName, filename, ec); }
+        if (!ok || ec)
+        {
+            std::filesystem::remove(tmpName, ec);
+            return false;
+        }
+        return true;
     }
     catch (...)
     {
+        std::error_code ec;
+        std::filesystem::remove(tmpName, ec);
         return false;
     }
 }
@@ -403,7 +426,7 @@ bool DiffDriveCollisionGridBased::loadColGridsFromFile(
             return false;  // Incompatible (old) format, just discard and
         // recompute.
 
-        return m_collisionGrid.loadFromFile(&arch, current_robotShape);
+        return m_collisionGrid.loadFromFile(*this, &arch, current_robotShape);
     }
     catch (...)
     {
@@ -417,8 +440,8 @@ const uint32_t COLGRID_FILE_MAGIC = 0xC0C0C0C3;
                     Save to file
   ---------------------------------------------------------------*/
 bool DiffDriveCollisionGridBased::CCollisionGrid::saveToFile(
-    mrpt::serialization::CArchive* f,
-    const mrpt::math::CPolygon&    computed_robotShape) const
+    const DiffDriveCollisionGridBased& parent, mrpt::serialization::CArchive* f,
+    const mrpt::math::CPolygon& computed_robotShape) const
 {
     try
     {
@@ -433,11 +456,11 @@ bool DiffDriveCollisionGridBased::CCollisionGrid::saveToFile(
 
         // Robot shape:
         *f << computed_robotShape;
-        *f << m_parent->m_clearance;
+        *f << parent.m_clearance;
 
         // and standard PTG data:
-        *f << m_parent->getDescription() << m_parent->getAlphaValuesCount()
-           << d2f(m_parent->getMax_V()) << d2f(m_parent->getMax_W());
+        *f << parent.getDescription() << parent.getAlphaValuesCount()
+           << d2f(parent.getMax_V()) << d2f(parent.getMax_W());
 
         *f << m_x_min << m_x_max << m_y_min << m_y_max;
         *f << m_resolution;
@@ -465,8 +488,8 @@ bool DiffDriveCollisionGridBased::CCollisionGrid::saveToFile(
                         loadFromFile
   ---------------------------------------------------------------*/
 bool DiffDriveCollisionGridBased::CCollisionGrid::loadFromFile(
-    mrpt::serialization::CArchive* f,
-    const mrpt::math::CPolygon&    current_robotShape)
+    const DiffDriveCollisionGridBased& parent, mrpt::serialization::CArchive* f,
+    const mrpt::math::CPolygon& current_robotShape)
 {
     try
     {
@@ -504,7 +527,7 @@ bool DiffDriveCollisionGridBased::CCollisionGrid::loadFromFile(
 
                 double stored_clearance = 0;
                 *f >> stored_clearance;
-                if (std::abs(stored_clearance - m_parent->m_clearance) > 1e-9)
+                if (std::abs(stored_clearance - parent.m_clearance) > 1e-9)
                 {
                     return false;
                 }
@@ -523,7 +546,7 @@ bool DiffDriveCollisionGridBased::CCollisionGrid::loadFromFile(
         };
 
         // Standard PTG data:
-        const std::string expected_desc = m_parent->getDescription();
+        const std::string expected_desc = parent.getDescription();
         std::string       desc;
         *f >> desc;
         if (desc != expected_desc) return false;
@@ -548,9 +571,9 @@ bool DiffDriveCollisionGridBased::CCollisionGrid::loadFromFile(
         if (std::abs(ff - _VAR) > 1e-6) return false; \
     }
 
-        READ_UINT16_CHECK_IT_MATCHES_STORED(m_parent->getAlphaValuesCount())
-        READ_FLOAT_CHECK_IT_MATCHES_STORED(m_parent->getMax_V())
-        READ_FLOAT_CHECK_IT_MATCHES_STORED(m_parent->getMax_W())
+        READ_UINT16_CHECK_IT_MATCHES_STORED(parent.getAlphaValuesCount())
+        READ_FLOAT_CHECK_IT_MATCHES_STORED(parent.getMax_V())
+        READ_FLOAT_CHECK_IT_MATCHES_STORED(parent.getMax_W())
 
         // Cell dimensions:
         READ_DOUBLE_CHECK_IT_MATCHES_STORED(m_x_min)
@@ -723,7 +746,7 @@ void DiffDriveCollisionGridBased::internal_initialize(
     ASSERTMSG_(
         m_robotShape.size() >= 3, "Robot shape must have 3 or more vertices");
     ASSERT_(refDistance > 0);
-    ASSERT_(V_MAX > 0);
+    ASSERT_GE_(V_MAX, 0.0);  // 0: rotations in place only
     ASSERT_(W_MAX > 0);
     ASSERT_(m_resolution > 0);
 
@@ -766,9 +789,12 @@ void DiffDriveCollisionGridBased::internal_initialize(
     if (loadColGridsFromFile(cacheFilename, m_robotShape))
     {
         if (verbose) cout << "loaded from file OK" << endl;
+        if (m_gridInitCallback) { m_gridInitCallback(true); }
     }
     else
     {
+        if (m_gridInitCallback) { m_gridInitCallback(false); }
+
         // BUGFIX: In case we start reading the file and in the end detected an
         // error,
         //         we must make sure that there's space enough for the grid:
@@ -1020,9 +1046,10 @@ std::optional<uint32_t> DiffDriveCollisionGridBased::getPathStepForDist(
 
     ASSERT_(numPoints > 0);
 
-    for (size_t n = 0; n < numPoints - 1; n++)
+    // First step reaching the given distance:
+    for (size_t n = 0; n < numPoints; n++)
     {
-        if (m_trajectory[k][n + 1].dist >= dist)
+        if (m_trajectory[k][n].dist >= dist)
         {
             return static_cast<uint32_t>(n);
         }

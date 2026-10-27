@@ -5,17 +5,82 @@
  * ------------------------------------------------------------------------- */
 
 #include <mpp/data/TrajectoriesAndRobotShape.h>
+#include <mpp/ptgs/DiffDriveCollisionGridBased.h>
+#include <mpp/ptgs/DiffDrive_C.h>
+#include <mpp/ptgs/DiffDrive_Spin.h>
+#include <mrpt/system/os.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
 
 using namespace mpp;
 
+namespace
+{
+// Directory for PTG collision grid cache files ("." if it cannot be created).
+std::string ptgCacheDirectory()
+{
+    std::string base;
+    if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+    {
+        base = xdg;
+    }
+    else if (const char* home = std::getenv("HOME"); home && *home)
+    {
+        base = std::string(home) + "/.cache";
+    }
+    if (base.empty()) { return "."; }
+    const std::string dir = base + "/mrpt_path_planning";
+    // Best effort: the cache is optional, so never throw from here.
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec || !std::filesystem::is_directory(dir, ec)) { return "."; }
+    return dir;
+}
+
+// Hash of all config keys defining PTG #n and the robot shape, to name its
+// cache file.
+size_t ptgConfigHash(
+    const mrpt::config::CConfigFileBase& c, const std::string& section,
+    unsigned int n)
+{
+    const std::string prefix = mrpt::format("PTG%u_", n);
+    std::string       all;
+    for (const auto& key : c.keys(section))
+    {
+        if (key.rfind(prefix, 0) == 0 || key.rfind("RobotModel_", 0) == 0)
+        {
+            all += key + "=" + c.read_string(section, key, "") + ";";
+        }
+    }
+    return std::hash<std::string>{}(all);
+}
+}  // namespace
+
 void TrajectoriesAndRobotShape::clear() { *this = TrajectoriesAndRobotShape(); }
 
+TrajectoriesAndRobotShape TrajectoriesAndRobotShape::clone() const
+{
+    TrajectoriesAndRobotShape r = *this;
+    for (auto& ptg : r.ptgs)
+    {
+        if (!ptg) { continue; }
+        auto* c = dynamic_cast<ptg_t*>(ptg->clone());
+        ASSERT_(c);
+        ptg.reset(c);
+    }
+    return r;
+}
+
 void TrajectoriesAndRobotShape::initFromConfigFile(
-    mrpt::config::CConfigFileBase& c, const std::string& s)
+    mrpt::config::CConfigFileBase& c, const std::string& s, bool initializePTGs,
+    const InitProgressCallback& progress)
 {
     MRPT_START
 
-    const auto   ptg_cache_files_directory = std::string(".");
+    const auto ptg_cache_files_directory =
+        initializePTGs ? ptgCacheDirectory() : std::string();
     unsigned int PTG_COUNT = c.read_int(s, "PTG_COUNT", 0, true);
 
     // Load robot shape: 1/2 polygon
@@ -45,9 +110,18 @@ void TrajectoriesAndRobotShape::initFromConfigFile(
             c.read_double(s, "RobotModel_circular_shape_radius", -1.0, false);
         robot_radius > 0)
     {
+        ASSERTMSG_(
+            xs.empty(),
+            "Both a polygonal (RobotModel_shape2D_*) and a circular "
+            "(RobotModel_circular_shape_radius) robot shape are defined: "
+            "define only one.");
         auto& r = robotShape.emplace<robot_radius_t>();
         r       = robot_radius;
     }
+
+    minTurningRadius =
+        c.read_double(s, "RobotModel_min_turning_radius", 0.0, false);
+    ASSERT_GE_(minTurningRadius, 0.0);
 
     // Load PTGs from file:
     // ---------------------------------------------
@@ -64,6 +138,29 @@ void TrajectoriesAndRobotShape::initFromConfigFile(
             sPTGName, c, s, mrpt::format("PTG%u_", n));
 
         ptgs[n] = new_ptg;
+
+        // Kinematic consistency with the vehicle (see minTurningRadius):
+        if (const auto* c_ptg =
+                dynamic_cast<const ptg::DiffDrive_C*>(new_ptg.get());
+            c_ptg && minTurningRadius > 0 && c_ptg->getMax_W() > 0)
+        {
+            const double R = c_ptg->getMax_V() / c_ptg->getMax_W();
+            ASSERTMSG_(
+                R >= minTurningRadius * (1.0 - 1e-3),
+                mrpt::format(
+                    "PTG%u has a turning radius (v_max/w_max) of %.3f m, "
+                    "smaller than RobotModel_min_turning_radius=%.3f m: plans "
+                    "would not be drivable by the vehicle.",
+                    n, R, minTurningRadius));
+        }
+        ASSERTMSG_(
+            !(minTurningRadius > 0 &&
+              dynamic_cast<const ptg::DiffDrive_Spin*>(new_ptg.get())),
+            mrpt::format(
+                "PTG%u rotates in place, but the vehicle has "
+                "RobotModel_min_turning_radius=%.3f m: plans would not be "
+                "drivable by it.",
+                n, minTurningRadius));
 
         // Initialize PTGs:
         new_ptg->deinitialize();
@@ -87,12 +184,41 @@ void TrajectoriesAndRobotShape::initFromConfigFile(
         }
 
         // Init:
-        new_ptg->initialize(
-            mrpt::format(
-                "%s/ptg_grid_%03u.dat.gz", ptg_cache_files_directory.c_str(),
-                n),
-            false /*verbose*/
-        );
+        if (initializePTGs)
+        {
+            const std::string cacheFile = mrpt::format(
+                "%s/ptg_grid_%016zx.dat.gz", ptg_cache_files_directory.c_str(),
+                ptgConfigHash(c, s, n));
+
+            // The collision grid PTGs tell when they know whether the grid is
+            // loaded or built; others have no grid to load.
+            bool reported = false;
+            auto report   = [&](bool fromCache)
+            {
+                if (reported) { return; }
+                reported = true;
+                progress(n, PTG_COUNT, new_ptg->getDescription(), fromCache);
+            };
+            auto* gridPtg =
+                dynamic_cast<ptg::DiffDriveCollisionGridBased*>(new_ptg.get());
+            if (progress && gridPtg) { gridPtg->setGridInitCallback(report); }
+            // (the callback refers to local variables)
+            struct ResetCallback
+            {
+                ptg::DiffDriveCollisionGridBased* grid;
+                ~ResetCallback()
+                {
+                    if (grid) { grid->setGridInitCallback({}); }
+                }
+            } resetCallback{gridPtg};
+
+            new_ptg->initialize(cacheFile, false /*verbose*/);
+            if (progress) { report(false); }
+        }
+    }
+    if (initializePTGs && progress)
+    {
+        progress(PTG_COUNT, PTG_COUNT, std::string(), true);
     }
     initialized_ = true;
     MRPT_END

@@ -103,3 +103,81 @@ selfdriving_add_test(
     SOURCES test_reeds_shepp.cpp
     LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
 )
+
+selfdriving_add_test(
+    TARGET  test_cost_evaluator_reverse
+    SOURCES test_cost_evaluator_reverse.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_cost_evaluator_turning
+    SOURCES test_cost_evaluator_turning.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_collision_guard
+    SOURCES test_collision_guard.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_robot_description
+    SOURCES test_robot_description.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_astar_start_clearance
+    SOURCES test_astar_start_clearance.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_trajectory_follower_closed_loop
+    SOURCES test_trajectory_follower_closed_loop.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_ptg_clone
+    SOURCES test_ptg_clone.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_astar_resumable
+    SOURCES test_astar_resumable.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_astar_start_velocity
+    SOURCES test_astar_start_velocity.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_followups
+    SOURCES test_followups.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_ptg_spin
+    SOURCES test_ptg_spin.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_astar_spin
+    SOURCES test_astar_spin.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)
+
+selfdriving_add_test(
+    TARGET  test_ptg_init_progress
+    SOURCES test_ptg_init_progress.cpp
+    LINK_LIBRARIES mrpt_path_planning GTest::GTest GTest::Main
+)

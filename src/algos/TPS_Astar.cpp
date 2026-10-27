@@ -14,11 +14,13 @@
 #include <mpp/data/MotionPrimitivesTree.h>
 #include <mpp/ptgs/DiffDriveCollisionGridBased.h>
 #include <mpp/ptgs/DiffDrive_C.h>
+#include <mpp/ptgs/DiffDrive_Spin.h>
 #include <mpp/ptgs/SpeedTrimmablePTG.h>
 #include <mrpt/math/wrap2pi.h>
 #include <mrpt/version.h>
 #include <mrpt/viz/Scene.h>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <queue>
@@ -27,6 +29,51 @@
 IMPLEMENTS_MRPT_OBJECT(TPS_Astar, Planner, mpp)
 
 using namespace mpp;
+
+namespace
+{
+// Margin [m] by which obstacles touching the footprint at the start pose may
+// get closer along edges leaving it (sensor noise, map quantization), so the
+// robot can also slide along them:
+constexpr double kStartTouchTolerance = 0.02;
+
+// Signed distance from a robot-frame point to the robot footprint (negative
+// inside). Point robots: distance to the origin.
+double signedDistanceToShape(double x, double y, const RobotShape& shape)
+{
+    if (const auto* r = std::get_if<robot_radius_t>(&shape))
+    {
+        return std::hypot(x, y) - *r;
+    }
+    const auto* poly = std::get_if<mrpt::math::TPolygon2D>(&shape);
+    if (!poly || poly->size() < 3) { return std::hypot(x, y); }
+
+    bool   inside = false;
+    double minD2  = std::numeric_limits<double>::infinity();
+    for (size_t i = 0, j = poly->size() - 1; i < poly->size(); j = i++)
+    {
+        const auto& a = (*poly)[j];
+        const auto& b = (*poly)[i];
+        if (((b.y > y) != (a.y > y)) &&
+            (x < (a.x - b.x) * (y - b.y) / (a.y - b.y) + b.x))
+        {
+            inside = !inside;
+        }
+        const double ex = b.x - a.x;
+        const double ey = b.y - a.y;
+        const double l2 = ex * ex + ey * ey;
+        const double t =
+            l2 > 0
+                ? std::clamp(((x - a.x) * ex + (y - a.y) * ey) / l2, 0.0, 1.0)
+                : 0.0;
+        const double dx = x - (a.x + t * ex);
+        const double dy = y - (a.y + t * ey);
+        minD2           = std::min(minD2, dx * dx + dy * dy);
+    }
+    const double d = std::sqrt(minD2);
+    return inside ? -d : d;
+}
+}  // namespace
 
 mrpt::containers::yaml TPS_Astar_Parameters::as_yaml()
 {
@@ -52,6 +99,13 @@ mrpt::containers::yaml TPS_Astar_Parameters::as_yaml()
     c["ptg_sample_timestamps"] = mrpt::containers::yaml::Sequence();
     for (const auto& v : ptg_sample_timestamps)
         c["ptg_sample_timestamps"].asSequence().push_back(v);
+
+    MCP_SAVE(c, use_spin_expansion);
+    c["spin_sample_angles"] = mrpt::containers::yaml::Sequence();
+    for (const auto& v : spin_sample_angles)
+    {
+        c["spin_sample_angles"].asSequence().push_back(mrpt::RAD2DEG(v));
+    }
 
     return c;
 }
@@ -81,6 +135,16 @@ void TPS_Astar_Parameters::load_from_yaml(const mrpt::containers::yaml& c)
     MCP_LOAD_OPT(c, use_reeds_shepp_heuristic);
     MCP_LOAD_OPT(c, use_reeds_shepp_expansion);
     MCP_LOAD_OPT(c, reeds_shepp_expansion_max_length);
+    MCP_LOAD_OPT(c, use_spin_expansion);
+    if (c.has("spin_sample_angles"))
+    {
+        ASSERT_(c["spin_sample_angles"].isSequence());
+        spin_sample_angles.clear();
+        for (const double deg : c["spin_sample_angles"].toStdVector<double>())
+        {
+            spin_sample_angles.push_back(mrpt::DEG2RAD(deg));
+        }
+    }
 
     MCP_LOAD_OPT(c, maximumComputationTime);
 }
@@ -98,12 +162,173 @@ TPS_Astar::TPS_Astar() : mrpt::system::COutputLogger("TPS_Astar")
     profiler_().setName("TPS_Astar");
 }
 
+TPS_Astar::TPS_Astar(const TPS_Astar& o) : TPS_Astar() { *this = o; }
+
+TPS_Astar& TPS_Astar::operator=(const TPS_Astar& o)
+{
+    if (this == &o) { return *this; }
+    params_                     = o.params_;
+    costEvaluators_             = o.costEvaluators_;
+    progressCallback_           = o.progressCallback_;
+    progressCallbackCallPeriod_ = o.progressCallbackCallPeriod_;
+    setMinLoggingLevel(o.getMinLoggingLevel());
+    // Default heuristic bound to this planner (never the source one):
+    heuristic = astar_heuristic_t(
+        [this](const SE2_KinState& from, const SE2orR2_KinState& goal)
+        { return this->default_heuristic(from, goal); });
+    search_ = SearchState();
+    return *this;
+}
+
 PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 {
     MRPT_START
     mrpt::system::CTimeLoggerEntry tleg(profiler_(), "plan");
 
-    const double planInitTime = mrpt::Clock::nowDouble();
+    start(in);
+    run_search(params_.maximumComputationTime);
+
+    PlannerOutput po = finalized_output(std::move(search_.po));
+    search_          = SearchState();
+    return po;
+    MRPT_END
+}
+
+PlannerOutput TPS_Astar::run(duration_seconds_t maxComputationTime)
+{
+    MRPT_START
+    ASSERTMSG_(search_.started, "run() called before start()");
+    run_search(maxComputationTime);
+    return finalized_output(search_.po);
+    MRPT_END
+}
+
+TPS_Astar::SliceResult TPS_Astar::run_slice(
+    duration_seconds_t maxComputationTime)
+{
+    MRPT_START
+    ASSERTMSG_(search_.started, "run_slice() called before start()");
+    run_search(maxComputationTime);
+    return make_slice_result(search_.po);
+    MRPT_END
+}
+
+std::tuple<
+    MotionPrimitivesTreeSE2::path_t, MotionPrimitivesTreeSE2::edge_sequence_t>
+    TPS_Astar::path_to_node(mrpt::graphs::TNodeID nodeId)
+{
+    ASSERTMSG_(search_.started, "path_to_node() called before start()");
+    auto& tree = search_.po.motionTree;
+    interpolate_path_to(tree, nodeId);
+    return tree.backtrack_path(nodeId);
+}
+
+TPS_Astar::SliceResult TPS_Astar::make_slice_result(
+    const PlannerOutput& po) const
+{
+    SliceResult r;
+    r.computationTime      = po.computationTime;
+    r.numExpandedNodes     = po.numExpandedNodes;
+    r.goalNodeId           = po.goalNodeId;
+    r.bestNodeId           = po.bestNodeId;
+    r.bestNodeIdCostToGoal = po.bestNodeIdCostToGoal;
+
+    // A clear shot not committed yet still reaches the goal:
+    if (search_.bestGoalCandidateShotId && r.goalNodeId != r.bestNodeId)
+    {
+        r.goalNodeId           = *search_.bestGoalCandidateShotId;
+        r.bestNodeId           = r.goalNodeId;
+        r.bestNodeIdCostToGoal = 0;
+    }
+    r.success = r.goalNodeId == r.bestNodeId;
+    if (r.bestNodeId)
+    {
+        r.pathCost = po.motionTree.nodes().at(*r.bestNodeId).cost_;
+    }
+    return r;
+}
+
+bool TPS_Astar::search_can_continue() const
+{
+    return search_.started && !search_.found && !search_.exhausted;
+}
+
+void TPS_Astar::set_obstacles(const std::vector<ObstacleSource::Ptr>& obstacles)
+{
+    ASSERTMSG_(search_.started, "set_obstacles() called before start()");
+    search_.in.obstacles               = obstacles;
+    search_.po.originalInput.obstacles = obstacles;
+    prepare_obstacles();
+}
+
+void TPS_Astar::prepare_obstacles()
+{
+    const auto& in             = search_.in;
+    auto&       obstaclePoints = search_.obstaclePoints;
+    obstaclePoints.clear();
+
+    rsExpansionRadius_ = 0.0;
+    if (params_.use_reeds_shepp_expansion && params_.use_analytic_expansion &&
+        !prepare_reeds_shepp_expansion(in.ptgs))
+    {
+        MRPT_LOG_DEBUG(
+            "Reeds-Shepp shot not used: it requires forward and reverse "
+            "DiffDrive_C PTGs with an odd number of trajectories.");
+    }
+    spinShotAvailable_ = false;
+    if (params_.use_spin_expansion && params_.use_analytic_expansion &&
+        !prepare_spin_expansion(in.ptgs))
+    {
+        MRPT_LOG_DEBUG(
+            "Spin shot not used: it requires a DiffDrive_Spin PTG and a "
+            "DiffDrive_C PTG with an odd number of trajectories.");
+    }
+
+    // obstacles (TODO: dynamic over future time?):
+    for (const auto& os : in.obstacles)
+    {
+        if (!os) continue;  // should never happen?
+
+        // apply clipping for efficiency:
+        // (z is arbitrary and ignored inside)
+        os->apply_clipping_box(mrpt::math::TBoundingBox(
+            {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
+            {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
+
+        // Get obstacles:
+        obstaclePoints.emplace_back(os->obstacles());
+    }
+
+    localObstaclesCache_.clear();
+    expandedTpObstaclesPose_.reset();
+
+    rsGoalObstacles_.clear();
+    rsGoalHeadings_.clear();
+    if (rsExpansionRadius_ > 0 && in.stateGoal.state.isPoint())
+    {
+        prepare_point_goal_shots(
+            in.stateGoal.state.point(), in.ptgs, obstaclePoints);
+        if (rsGoalHeadings_.empty())
+        {
+            MRPT_LOG_DEBUG(
+                "Reeds-Shepp shot not used: the footprint fits at no heading "
+                "at the goal point.");
+            rsExpansionRadius_ = 0;
+        }
+    }
+}
+
+void TPS_Astar::start(const PlannerInput& inArg)
+{
+    MRPT_START
+    mrpt::system::CTimeLoggerEntry tle(profiler_(), "start");
+
+    const double startInitTime = mrpt::Clock::nowDouble();
+
+    search_         = SearchState();
+    search_.started = true;
+    search_.in      = inArg;
+    const auto& in  = search_.in;
 
     // Sanity checks on inputs:
     ASSERT_(in.ptgs.initialized());
@@ -124,16 +349,37 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
     MRPT_LOG_DEBUG_STREAM("Obstacle sources: " << in.obstacles.size());
     MRPT_LOG_DEBUG_STREAM("Cost evaluators: " << costEvaluators_.size());
 
-    PlannerOutput po;
+    auto& po         = search_.po;
     po.originalInput = in;
 
     auto& tree = po.motionTree;  // shortcut
+
+    // Detection of a start pose closer than the PTG clearance to obstacles
+    // (see local_obstacles_to_buffers()). The collision grid cell size is
+    // added, since cells are marked conservatively:
+    startPose_            = in.stateStart.pose;
+    startRobotShape_      = in.ptgs.robotShape;
+    startClearance_       = 0;
+    startWithinClearance_ = false;
+    startLocalObstacles_.clear();
+    for (const auto& ptg : in.ptgs.ptgs)
+    {
+        if (const auto* g =
+                dynamic_cast<const ptg::DiffDriveCollisionGridBased*>(
+                    ptg.get()))
+        {
+            mrpt::keep_max(
+                startClearance_,
+                g->getClearance() + 2 * g->getCollisionGridResolution());
+        }
+    }
 
     // clipping dist for all ptgs:
     double MAX_XY_DIST = 0;
     for (const auto& ptg : in.ptgs.ptgs)
         mrpt::keep_max(MAX_XY_DIST, obstacle_clipping_distance(*ptg));
     ASSERT_(MAX_XY_DIST > 0);
+    search_.maxXYDist = MAX_XY_DIST;
 
     // Cache max linear speed for heuristic unit conversion (distance→time).
     maxLinSpeed_ = 0.0;
@@ -141,11 +387,20 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         mrpt::keep_max(maxLinSpeed_, ptg->getMaxLinVel());
     if (maxLinSpeed_ <= 0) maxLinSpeed_ = 1.0;  // fallback: units = distance
 
+    prepare_rotations_in_place(in.ptgs);
+
     reedsSheppTurningRadius_ = 0.0;
     if (params_.use_reeds_shepp_heuristic)
     {
         reedsSheppTurningRadius_ = reeds_shepp_turning_radius(in.ptgs);
-        if (reedsSheppTurningRadius_ <= 0)
+        // (Expected with rotations in place: it would not be a lower bound)
+        if (reedsSheppTurningRadius_ <= 0 && spinPtgIndex_)
+        {
+            MRPT_LOG_DEBUG(
+                "use_reeds_shepp_heuristic ignored: not a lower bound with "
+                "rotations in place.");
+        }
+        else if (reedsSheppTurningRadius_ <= 0)
         {
             MRPT_LOG_WARN(
                 "use_reeds_shepp_heuristic ignored: it requires all PTGs to "
@@ -153,81 +408,16 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         }
     }
 
-    rsExpansionRadius_ = 0.0;
-    if (params_.use_reeds_shepp_expansion && params_.use_analytic_expansion &&
-        !prepare_reeds_shepp_expansion(in.ptgs))
-    {
-        MRPT_LOG_DEBUG(
-            "Reeds-Shepp shot not used: it requires forward and reverse "
-            "DiffDrive_C PTGs with an odd number of trajectories.");
-    }
-
-    // obstacles (TODO: dynamic over future time?):
-    std::vector<mrpt::maps::CPointsMap::Ptr> obstaclePoints;
-    for (const auto& os : in.obstacles)
-    {
-        if (!os) continue;  // should never happen?
-
-        // apply clipping for efficiency:
-        // (z is arbitrary and ignored inside)
-        os->apply_clipping_box(mrpt::math::TBoundingBox(
-            {in.worldBboxMin.x, in.worldBboxMin.y, -1.0},
-            {in.worldBboxMax.x, in.worldBboxMax.y, 1.0}));
-
-        // Get obstacles:
-        obstaclePoints.emplace_back(os->obstacles());
-    }
-
     //  2  |  E T ← ∅         # Tree edges
     // ------------------------------------------------------------------
     tree.edges_to_children.clear();
 
     grid_.clear();
-    localObstaclesCache_.clear();
-    expandedTpObstaclesPose_.reset();
-
-    rsGoalObstacles_.clear();
-    rsGoalHeadings_.clear();
-    if (rsExpansionRadius_ > 0 && in.stateGoal.state.isPoint())
-    {
-        prepare_point_goal_shots(
-            in.stateGoal.state.point(), in.ptgs, obstaclePoints);
-        if (rsGoalHeadings_.empty())
-        {
-            MRPT_LOG_DEBUG(
-                "Reeds-Shepp shot not used: the footprint fits at no heading "
-                "at the goal point.");
-            rsExpansionRadius_ = 0;
-        }
-    }
-
-    // ----------------------------------------
-    //
-    // A* algorithm
-    //
-    // ----------------------------------------
-    // Open set, ordered by fScore; ties are popped in insertion order (FIFO),
-    // as a std::multimap keyed by fScore would do, but without one heap
-    // allocation per insertion.
-    struct OpenEntry
-    {
-        distance_t fScore;
-        uint64_t   seq;
-        Node*      node;
-        bool       operator>(const OpenEntry& o) const
-        {
-            return fScore != o.fScore ? fScore > o.fScore : seq > o.seq;
-        }
-    };
-    std::priority_queue<
-        OpenEntry, std::vector<OpenEntry>, std::greater<OpenEntry>>
-                          openSet;
-    uint64_t              openSeq    = 0;
-    mrpt::graphs::TNodeID nextFreeId = 0;
+    prepare_obstacles();
 
     // openSet <- startNode
     {
-        auto& n = getOrCreateNodeByPose(in.stateStart, nextFreeId);
+        auto& n = getOrCreateNodeByPose(in.stateStart, search_.nextFreeId);
         n.state = in.stateStart;
 
         //   X_T ← {X_0 }    # Tree nodes (state space)
@@ -239,53 +429,30 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         n.fScore = params_.heuristic_epsilon * heuristic(n.state, in.stateGoal);
         n.pendingInOpenSet = true;
 
-        openSet.push({n.fScore, openSeq++, &n});
+        search_.openSet.push({n.fScore, search_.openSeq++, &n});
     }
 
     // Define goal node ID:
     // Use a pointer so we can replace it with a pointer to a different node as
     // needed.
-    auto* nodeGoal =
-        &getOrCreateNodeByPose(in.stateGoal.asSE2KinState(), nextFreeId);
-    po.goalNodeId = nodeGoal->id.value();
+    search_.nodeGoal = &getOrCreateNodeByPose(
+        in.stateGoal.asSE2KinState(), search_.nextFreeId);
+    po.goalNodeId = search_.nodeGoal->id.value();
 
     // Goal cell indices:
-    const auto goalCellIndices =
-        in.stateGoal.state.isPoint()
-            ? nodeGridCoords(in.stateGoal.state.point())
-            : nodeGridCoords(in.stateGoal.state.pose());
+    search_.goalCellIndices = in.stateGoal.state.isPoint()
+                                  ? nodeGridCoords(in.stateGoal.state.point())
+                                  : nodeGridCoords(in.stateGoal.state.pose());
 
     // Desired speed at goal, stored as **absolute linear speed in m/s**.
     // Each PTG normalises this against its own v_max when it reads the map
     // (see find_feasible_paths_to_neighbors).  Only the XY linear component
     // is used; a purely-angular exit velocity maps to 0 (stop) because
     // PTG targetRelSpeed is a linear-speed modifier.
-    nodes_with_desired_speed_t nodesWithDesiredSpeed;
-    nodesWithDesiredSpeed[goalCellIndices] =
+    search_.nodesWithDesiredSpeed[search_.goalCellIndices] =
         std::hypot(in.stateGoal.vel.vx, in.stateGoal.vel.vy);
 
-    unsigned int nIter = 0;
-
-    double tLastCallback = planInitTime;
-
-    // Analytic goal expansion (deferred, optimality-preserving): when a
-    // collision-free edge lands in the goal cell we remember it as a
-    // *candidate* solution instead of terminating immediately. Stopping on the
-    // first such edge is greedy and can produce grossly suboptimal paths: with
-    // an SE(2) goal, a node that arrived at the goal xy but a couple of yaw
-    // cells off can only re-enter the exact goal cell through a
-    // near-full-circle PTG arc (with a tight turning radius), so that first
-    // edge is a ~360 deg loop (see fig:cases in the paper). We instead keep the
-    // cheapest goal-landing candidate and only commit once its actual cost is
-    // provably (eps-)optimal, i.e. <= the minimum fScore still pending in the
-    // open set (committed at the top of the loop). This preserves the
-    // early-termination speed-up without accepting the loop, and is a no-op for
-    // R(2) point goals (verified identical on the 300-world BARN sweep).
-    Node*  bestGoalCandidate  = nullptr;
-    cost_t bestGoalCandidateG = std::numeric_limits<cost_t>::max();
-    // A goal candidate may also be the last node of a Reeds-Shepp shot, which
-    // lives in the tree only (not in the lattice):
-    std::optional<mrpt::graphs::TNodeID> bestGoalCandidateShotId;
+    search_.tLastCallback = startInitTime;
 
     // Defer building per-edge interpolated paths during the search: it is a
     // major cost (a std::map per edge) and is only needed for (a) cost
@@ -293,15 +460,45 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
     // callbacks that inspect the partial path. When none of these apply, we
     // store only estimatedExecTime during the search and interpolate just the
     // final solution edges at the end.
-    const bool deferInterpolation =
+    search_.deferInterpolation =
         costEvaluators_.empty() &&
         params_.saveDebugVisualizationDecimation == 0 && !progressCallback_;
 
-    // Tries a Reeds-Shepp shot from `n` to the goal (see
-    // use_reeds_shepp_expansion). A clear shot becomes the goal candidate if
-    // it is cheaper than the current one or, with `replace`, in any case (an
-    // exact goal is preferred to a candidate anywhere in the goal cell).
-    // Returns whether the shot is clear.
+    po.computationTime = mrpt::Clock::nowDouble() - startInitTime;
+    MRPT_END
+}
+
+void TPS_Astar::run_search(duration_seconds_t maxComputationTime)
+{
+    if (!search_can_continue()) { return; }
+
+    mrpt::system::CTimeLoggerEntry tleRun(profiler_(), "run_search");
+    const double                   runInitTime = mrpt::Clock::nowDouble();
+
+    // Shortcuts to the search state:
+    const PlannerInput& in                    = search_.in;
+    PlannerOutput&      po                    = search_.po;
+    auto&               tree                  = po.motionTree;
+    auto&               openSet               = search_.openSet;
+    auto&               openSeq               = search_.openSeq;
+    auto&               nextFreeId            = search_.nextFreeId;
+    Node*&              nodeGoal              = search_.nodeGoal;
+    const auto&         goalCellIndices       = search_.goalCellIndices;
+    const auto&         nodesWithDesiredSpeed = search_.nodesWithDesiredSpeed;
+    auto&               nIter                 = search_.nIter;
+    auto&               tLastCallback         = search_.tLastCallback;
+    auto&               bestGoalCandidate     = search_.bestGoalCandidate;
+    auto&               bestGoalCandidateG    = search_.bestGoalCandidateG;
+    auto&        bestGoalCandidateShotId      = search_.bestGoalCandidateShotId;
+    const bool   deferInterpolation           = search_.deferInterpolation;
+    const auto&  obstaclePoints               = search_.obstaclePoints;
+    const double MAX_XY_DIST                  = search_.maxXYDist;
+
+    // Tries a Reeds-Shepp or spin shot from `n` to the goal (see
+    // use_reeds_shepp_expansion, use_spin_expansion). A clear shot becomes the
+    // goal candidate if it is cheaper than the current one or, with `replace`,
+    // in any case (an exact goal is preferred to a candidate anywhere in the
+    // goal cell). Returns whether the shot is clear.
     auto tryReedsSheppShot = [&](const Node& n, bool replace, bool allHeadings)
     {
         double maxLength = params_.reeds_shepp_expansion_max_length;
@@ -310,7 +507,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             mrpt::keep_min(
                 maxLength, (bestGoalCandidateG - n.gScore) * maxLinSpeed_);
         }
-        const auto shot = reeds_shepp_shot(
+        const auto shot = goal_shot(
             n, in.stateGoal, maxLength, allHeadings, in.ptgs, obstaclePoints,
             MAX_XY_DIST, in);
         if (shot.empty()) { return false; }
@@ -385,6 +582,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             po.bestNodeId           = po.goalNodeId;
             po.bestNodeIdCostToGoal = 0;
             MRPT_LOG_DEBUG("Reeds-Shepp shot committed as the solution.");
+            search_.found = true;
             break;
         }
         if (params_.use_analytic_expansion && bestGoalCandidate != nullptr &&
@@ -393,7 +591,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             Node& gn = *bestGoalCandidate;
             // Reach the goal exactly from the candidate, if possible. The
             // shot is then committed by the rule above.
-            if (rsExpansionRadius_ > 0 && tryShotBeforeEndingInGoalCell(gn))
+            if (goal_shots_available() && tryShotBeforeEndingInGoalCell(gn))
             {
                 continue;
             }
@@ -414,6 +612,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
             MRPT_LOG_DEBUG_STREAM(
                 "Analytic expansion: optimal goal candidate committed at "
                 << gn.state.asString());
+            search_.found = true;
             break;
         }
 
@@ -429,7 +628,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         // without shots, before any goal-cell node has been expanded.
         if (const auto curNodeGridIdx = nodeGridCoords(current.state.pose);
             curNodeGridIdx.sameLocation(goalCellIndices) &&
-            !(rsExpansionRadius_ > 0 &&
+            !(goal_shots_available() &&
               (bestGoalCandidateShotId.has_value() ||
                tryShotBeforeEndingInGoalCell(current))))
         {
@@ -468,11 +667,16 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
                 // Update in our internal A* node:
                 current.state.pose = goalPose;
 
+                // (the best node so far may not be it, e.g. if this is the
+                // start node, in the goal cell)
+                po.goalNodeId           = current.id.value();
+                po.bestNodeId           = po.goalNodeId;
                 po.bestNodeIdCostToGoal = 0;
             }
             // Update in the tree node also:
             tree.node_state(*current.id).pose = current.state.pose;
 
+            search_.found = true;
             break;
         }
 
@@ -666,15 +870,16 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
         // Reeds-Shepp shot to the goal (see use_reeds_shepp_expansion), if
         // a lower bound of its cost can improve on the current candidate:
-        if (rsExpansionRadius_ > 0)
+        if (goal_shots_available())
         {
+            // (The straight distance also bounds the spin shot)
             const double lowerBoundLength =
-                in.stateGoal.state.isPose()
+                in.stateGoal.state.isPose() && !spinShotAvailable_
                     ? reeds_shepp_distance(
                           current.state.pose, in.stateGoal.state.pose(),
                           rsExpansionRadius_)
                     : (current.state.pose.translation() -
-                       in.stateGoal.state.point())
+                       in.stateGoal.asSE2KinState().pose.translation())
                           .norm();
             if (current.gScore + lowerBoundLength / maxLinSpeed_ <
                     bestGoalCandidateG &&
@@ -706,7 +911,7 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
         const double tNow = mrpt::Clock::nowDouble();
 
         // timeout?
-        if ((tNow - planInitTime) > params_.maximumComputationTime)
+        if ((tNow - runInitTime) > maxComputationTime)
         {
             // timeout
             MRPT_LOG_DEBUG("Timeout.");
@@ -737,32 +942,30 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
 
     }  // end while openSet!=empty
 
+    if (openSet.empty() && !search_.found) { search_.exhausted = true; }
+
+    po.computationTime += mrpt::Clock::nowDouble() - runInitTime;
+}
+
+PlannerOutput TPS_Astar::finalized_output(PlannerOutput po) const
+{
+    auto& tree = po.motionTree;
+
     // A clear shot not committed yet (timeout or exhausted open set) still
     // reaches the goal:
-    if (bestGoalCandidateShotId && po.goalNodeId != po.bestNodeId)
+    if (search_.bestGoalCandidateShotId && po.goalNodeId != po.bestNodeId)
     {
-        po.goalNodeId           = *bestGoalCandidateShotId;
+        po.goalNodeId           = *search_.bestGoalCandidateShotId;
         po.bestNodeId           = po.goalNodeId;
         po.bestNodeIdCostToGoal = 0;
     }
 
     // If interpolation was deferred during the search, build it now for just
-    // the final solution-path edges (needed for output / refinement / exec).
-    if (deferInterpolation && po.bestNodeId.has_value() &&
-        po.goalNodeId == po.bestNodeId)
+    // the edges of the path to the best node (needed for output / refinement
+    // / exec), also for a partial path.
+    if (po.bestNodeId.has_value())
     {
-        const auto [solNodes, solEdges] =
-            tree.backtrack_path(po.bestNodeId.value());
-        for (auto* e : solEdges)
-        {
-            if (e == nullptr) { continue; }
-            // Recover the relative reconstruction pose (stateTo in the frame
-            // of stateFrom); identical to what was used during the search.
-            const auto reconstrRelPose = e->stateTo.pose - e->stateFrom.pose;
-            edge_interpolated_path(
-                *e, in.ptgs, reconstrRelPose, e->ptgStepIndex,
-                params_.pathInterpolatedSegments);
-        }
+        interpolate_path_to(tree, *po.bestNodeId);
     }
 
     // A* ended, now collect the result:
@@ -781,9 +984,142 @@ PlannerOutput TPS_Astar::plan(const PlannerInput& in)
     po.success = po.goalNodeId == po.bestNodeId;
     if (po.bestNodeId) po.pathCost = tree.nodes().at(*po.bestNodeId).cost_;
 
-    po.computationTime = mrpt::Clock::nowDouble() - planInitTime;
-
     return po;
+}
+
+void TPS_Astar::interpolate_path_to(
+    MotionPrimitivesTreeSE2& tree, mrpt::graphs::TNodeID nodeId) const
+{
+    if (!search_.deferInterpolation) { return; }
+
+    const auto& in                  = search_.in;
+    const auto [solNodes, solEdges] = tree.backtrack_path(nodeId);
+    for (auto* e : solEdges)
+    {
+        if (e == nullptr) { continue; }
+        // Recover the relative reconstruction pose (stateTo in the frame
+        // of stateFrom); identical to what was used during the search.
+        const auto reconstrRelPose = e->stateTo.pose - e->stateFrom.pose;
+        edge_interpolated_path(
+            *e, in.ptgs, reconstrRelPose, e->ptgStepIndex,
+            params_.pathInterpolatedSegments);
+    }
+}
+
+bool TPS_Astar::reroot(mrpt::graphs::TNodeID newRoot)
+{
+    MRPT_START
+    mrpt::system::CTimeLoggerEntry tle(profiler_(), "reroot");
+
+    ASSERTMSG_(search_.started, "reroot() called before start()");
+    auto& s    = search_;
+    auto& tree = s.po.motionTree;
+    if (tree.nodes().count(newRoot) == 0) { return false; }
+    if (newRoot == tree.root) { return true; }
+
+    // Search costs (lattice gScore) equal tree costs: rebase both by the
+    // same amount, so they stay identical (the search relies on it).
+    const cost_t rootCost = tree.nodes().at(newRoot).cost_;
+    const auto   kept     = tree.prune_to_subtree(newRoot);
+
+    // Lattice: keep the subtree nodes and the goal placeholder (a node never
+    // reached, with no tree node); free the cells of the other nodes.
+    for (auto it = grid_.begin(); it != grid_.end();)
+    {
+        Node&      n         = it->second;
+        const bool inSubtree = n.id && kept.count(*n.id) != 0;
+        const bool neverReached =
+            !n.cameFrom && n.gScore == std::numeric_limits<cost_t>::max() &&
+            !(n.id && *n.id == newRoot);
+        if (!inSubtree && !neverReached)
+        {
+            if (s.bestGoalCandidate == &n) { s.bestGoalCandidate = nullptr; }
+            if (s.nodeGoal == &n) { s.nodeGoal = nullptr; }
+            it = grid_.erase(it);
+            continue;
+        }
+        if (inSubtree)
+        {
+            n.gScore -= rootCost;
+            n.fScore -= rootCost;
+            if (*n.id == newRoot)
+            {
+                n.cameFrom.reset();
+                n.gScore = 0;
+                n.fScore = params_.heuristic_epsilon *
+                           heuristic(n.state, s.in.stateGoal);
+            }
+        }
+        ++it;
+    }
+
+    // Goal candidates:
+    const bool shotKept = s.bestGoalCandidateShotId &&
+                          kept.count(*s.bestGoalCandidateShotId) != 0;
+    if (s.bestGoalCandidateShotId && !shotKept)
+    {
+        s.bestGoalCandidateShotId.reset();
+    }
+    if (shotKept)
+    {
+        s.bestGoalCandidateG =
+            tree.nodes().at(*s.bestGoalCandidateShotId).cost_;
+    }
+    else if (s.bestGoalCandidate)
+    {
+        s.bestGoalCandidateG = s.bestGoalCandidate->gScore;
+    }
+    else { s.bestGoalCandidateG = std::numeric_limits<cost_t>::max(); }
+
+    // Goal node, best node:
+    auto& po = s.po;
+    if (s.found && po.goalNodeId && kept.count(*po.goalNodeId) == 0)
+    {
+        s.found = false;
+    }
+    if (!s.nodeGoal)
+    {
+        s.nodeGoal = &getOrCreateNodeByPose(
+            s.in.stateGoal.asSE2KinState(), s.nextFreeId);
+    }
+    if (!s.found) { po.goalNodeId = s.nodeGoal->id.value(); }
+
+    po.bestNodeId.reset();
+    po.bestNodeIdCostToGoal = std::numeric_limits<cost_t>::max();
+    for (const auto& [id, node] : tree.nodes())
+    {
+        const cost_t h = (s.found && po.goalNodeId == id)
+                             ? 0
+                             : heuristic(node, s.in.stateGoal);
+        if (h < po.bestNodeIdCostToGoal)
+        {
+            po.bestNodeIdCostToGoal = h;
+            po.bestNodeId           = id;
+        }
+    }
+    if (s.found) { po.bestNodeId = po.goalNodeId; }
+
+    // Open set: the open nodes of the subtree.
+    s.openSet = open_set_t();
+    for (auto& [coords, n] : grid_)
+    {
+        if (n.pendingInOpenSet && !n.visited && n.id && kept.count(*n.id))
+        {
+            s.openSet.push({n.fScore, s.openSeq++, &n});
+        }
+    }
+    s.exhausted = s.openSet.empty() && !s.found;
+
+    // The new start:
+    const auto& rootState       = tree.nodes().at(newRoot);
+    s.in.stateStart.pose        = rootState.pose;
+    s.in.stateStart.vel         = rootState.vel;
+    po.originalInput.stateStart = s.in.stateStart;
+    startPose_                  = rootState.pose;
+    startWithinClearance_       = false;
+    startLocalObstacles_.clear();
+
+    return true;
     MRPT_END
 }
 
@@ -810,7 +1146,7 @@ cost_t TPS_Astar::default_heuristic_SE2(
     }
 
     mpp::PoseDistanceMetric_Lie<mpp::SE2_KinState> metric(
-        params_.SE2_metricAngleWeight);
+        heuristicAngleScale_ * params_.SE2_metricAngleWeight);
 
     // Distance in SE(2):
     const double distSE2 = metric.distance(from.pose, goal);
@@ -823,7 +1159,8 @@ cost_t TPS_Astar::default_heuristic_SE2(
             : std::abs(mrpt::math::angDistance(
                   std::atan2(relPose.y, relPose.x), from.pose.phi));
 
-    cost_t h = (distSE2 + params_.heuristic_heading_weight * distHeading) /
+    cost_t h = (distSE2 + heuristicAngleScale_ *
+                              params_.heuristic_heading_weight * distHeading) /
                maxLinSpeed_;
 
     return h;
@@ -871,6 +1208,62 @@ cost_t TPS_Astar::default_heuristic(
         return default_heuristic_SE2(from, goal.state.pose());
     else
         THROW_EXCEPTION("Goal of unknown type?");
+}
+
+void TPS_Astar::prepare_rotations_in_place(const TrajectoriesAndRobotShape& trs)
+{
+    // The angular terms of the SE(2) heuristic may not exceed the time to
+    // rotate in place. (A rotation changes the heading term of
+    // default_heuristic_SE2() by up to twice its angle.)
+    spinPtgIndex_.reset();
+    heuristicAngleScale_ = 1.0;
+    for (size_t i = 0; i < trs.ptgs.size(); i++)
+    {
+        const auto* spin =
+            dynamic_cast<const ptg::DiffDrive_Spin*>(trs.ptgs[i].get());
+        if (!spin || spinPtgIndex_) { continue; }
+        spinPtgIndex_ = i;
+
+        const double angleWeights = params_.SE2_metricAngleWeight +
+                                    2 * params_.heuristic_heading_weight;
+        const double maxWeights = maxLinSpeed_ / spin->getMaxAngVel();
+        if (angleWeights > maxWeights)
+        {
+            heuristicAngleScale_ = maxWeights / angleWeights;
+        }
+    }
+}
+
+std::vector<double> TPS_Astar::spin_angles_to_sample(
+    const mrpt::math::TPose2D& from, const SE2orR2_KinState& goal) const
+{
+    std::vector<double> angles;
+    for (const double a : params_.spin_sample_angles)
+    {
+        angles.push_back(a);
+        // (+-pi reach the same pose)
+        if (std::abs(a) < M_PI - 1e-6) { angles.push_back(-a); }
+    }
+    // Facing the goal, forward and backward, and its heading:
+    const auto relGoal = goal.asSE2KinState().pose - from;
+    if (std::hypot(relGoal.x, relGoal.y) > params_.grid_resolution_xy)
+    {
+        const double bearing = std::atan2(relGoal.y, relGoal.x);
+        angles.push_back(bearing);
+        angles.push_back(mrpt::math::wrapToPi(bearing + M_PI));
+    }
+    if (goal.state.isPose())
+    {
+        angles.push_back(mrpt::math::wrapToPi(relGoal.phi));
+    }
+    // Smaller rotations would not leave the lattice cell:
+    angles.erase(
+        std::remove_if(
+            angles.begin(), angles.end(),
+            [this](double a)
+            { return std::abs(a) < 0.5 * params_.grid_resolution_yaw; }),
+        angles.end());
+    return angles;
 }
 
 TPS_Astar::list_paths_to_neighbors_t
@@ -950,89 +1343,117 @@ TPS_Astar::list_paths_to_neighbors_t
             tle3.stop();
         }
 
-        // explore a subset of all trajectories only:
-        std::set<trajectory_index_t> trajIdxsToConsider;
-        std::vector<TPS_point>       tpsPointsToConsider;
-        std::set<size_t> targetTpsPointIndx;  // if reachable with ptg
+        std::vector<TPS_point> tpsPointsToConsider;
+        std::set<size_t>       targetTpsPointIndx;  // if reachable with ptg
 
-        ASSERT_(params_.max_ptg_trajectories_to_explore >= 2);
-        for (size_t i = 0; i < params_.max_ptg_trajectories_to_explore; i++)
+        // Rotations in place are sampled by angle (see spin_sample_angles):
+        if (const auto* spin =
+                dynamic_cast<const ptg::DiffDrive_Spin*>(ptg.get());
+            spin)
         {
-            trajectory_index_t trjIdx = mrpt::round(
-                i * (ptg->getPathCount() - 1) /
-                (params_.max_ptg_trajectories_to_explore - 1));
-            trajIdxsToConsider.insert(trjIdx);
-        }
-
-        // Build possible distances for each path:
-        std::vector<normalized_speed_t> speedsToConsider;
-        if (ptgTrimmable)
-        {
-            // N=1 ==>  [1.0]
-            // N=2 ==>  [0.5, 1.0]
-            // N=3 ==>  [0.33, 0.66, 1.0]
-            // ....
-
-            ASSERT_(params_.max_ptg_speeds_to_explore >= 1);
-            normalized_speed_t speedStep =
-                1.0 / params_.max_ptg_speeds_to_explore;
-            for (normalized_speed_t s = speedStep; s < 1.001; s += speedStep)
-                speedsToConsider.push_back(s);
+            for (const double a :
+                 spin_angles_to_sample(from.state.pose, goalState))
+            {
+                if (const auto ks = spin->rotationToTrajectoryStep(a); ks)
+                {
+                    tpsPointsToConsider.emplace_back(
+                        ks->first, ks->second, 1.0);
+                }
+            }
         }
         else
         {
-            // No speed-trimmable PTG:
-            speedsToConsider.push_back(1.0);
-        }
+            // explore a subset of all trajectories only:
+            std::set<trajectory_index_t> trajIdxsToConsider;
 
-        // make sure of including the trajectory towards the target, if we
-        // are close enough, plus its immediate neighboring paths:
-        {
-            const double queryTolerance = params_.grid_resolution_xy;
-            const auto   trgInvMap =
-                ptg->inverseMap_WS2TP(relGoal.x, relGoal.y, queryTolerance);
-            if (trgInvMap.has_value())
+            ASSERT_(params_.max_ptg_trajectories_to_explore >= 2);
+            for (size_t i = 0; i < params_.max_ptg_trajectories_to_explore; i++)
             {
-                const int                   relTrg_k    = trgInvMap->first;
-                const normalized_distance_t relTrg_d    = trgInvMap->second;
-                ptg_step_t                  relTrg_step = 0;
-                if (ptg->getPathStepForDist(relTrg_k, relTrg_d, relTrg_step))
-                {
-                    // Add direct path to target, and keep a copy of its value:
-                    for (auto speed : speedsToConsider)
-                    {
-                        const auto trgTps =
-                            TPS_point(relTrg_k, relTrg_step, speed);
-
-                        tpsPointsToConsider.emplace_back(trgTps);
-
-                        // save its index:
-                        targetTpsPointIndx.insert(
-                            tpsPointsToConsider.size() - 1);
-                    }
-                }
-
-                // and also, in general, the path:
-                trajIdxsToConsider.insert(relTrg_k);
+                trajectory_index_t trjIdx = mrpt::round(
+                    double(i) * double(ptg->getPathCount() - 1) /
+                    double(params_.max_ptg_trajectories_to_explore - 1));
+                trajIdxsToConsider.insert(trjIdx);
             }
-        }
+            // Always include the straight trajectory (alpha=0), which an evenly
+            // spaced subset may skip (e.g. an even count out of an odd number
+            // of paths): without it, every edge turns and paths zigzag.
+            trajIdxsToConsider.insert(ptg->alpha2index(0.0));
 
-        for (const auto speed : speedsToConsider)
-        {
-            for (const auto trjIdx : trajIdxsToConsider)
+            // Build possible distances for each path:
+            std::vector<normalized_speed_t> speedsToConsider;
+            if (ptgTrimmable)
             {
-                for (duration_seconds_t t : params_.ptg_sample_timestamps)
+                // N=1 ==>  [1.0]
+                // N=2 ==>  [0.5, 1.0]
+                // N=3 ==>  [0.33, 0.66, 1.0]
+                // ....
+
+                ASSERT_(params_.max_ptg_speeds_to_explore >= 1);
+                normalized_speed_t speedStep =
+                    1.0 / params_.max_ptg_speeds_to_explore;
+                for (normalized_speed_t s = speedStep; s < 1.001;
+                     s += speedStep)
+                    speedsToConsider.push_back(s);
+            }
+            else
+            {
+                // No speed-trimmable PTG:
+                speedsToConsider.push_back(1.0);
+            }
+
+            // make sure of including the trajectory towards the target, if we
+            // are close enough:
+            {
+                const double queryTolerance = params_.grid_resolution_xy;
+                const auto   trgInvMap =
+                    ptg->inverseMap_WS2TP(relGoal.x, relGoal.y, queryTolerance);
+                if (trgInvMap.has_value())
                 {
-                    ptg_step_t trjStep = mrpt::round(t / ptg_dt);
+                    const int                   relTrg_k = trgInvMap->first;
+                    const normalized_distance_t relTrg_d = trgInvMap->second;
+                    if (const auto relTrgStepOpt =
+                            ptg->getPathStepForDist(relTrg_k, relTrg_d))
+                    {
+                        const ptg_step_t relTrg_step = *relTrgStepOpt;
 
-                    // skip if this PTG path ends earlier than the specified
-                    // timestamp:
-                    const auto maxSteps = ptg->getPathStepCount(trjIdx);
+                        // Add direct path to target, and keep a copy of its
+                        // value:
+                        for (auto speed : speedsToConsider)
+                        {
+                            const auto trgTps =
+                                TPS_point(relTrg_k, relTrg_step, speed);
 
-                    ASSERT_(maxSteps >= 1);
-                    if (trjStep >= maxSteps) continue;
+                            tpsPointsToConsider.emplace_back(trgTps);
 
-                    tpsPointsToConsider.emplace_back(trjIdx, trjStep, speed);
+                            // save its index:
+                            targetTpsPointIndx.insert(
+                                tpsPointsToConsider.size() - 1);
+                        }
+                    }
+
+                    // and also, in general, the path:
+                    trajIdxsToConsider.insert(relTrg_k);
+                }
+            }
+
+            for (const auto speed : speedsToConsider)
+            {
+                for (const auto trjIdx : trajIdxsToConsider)
+                {
+                    for (duration_seconds_t t : params_.ptg_sample_timestamps)
+                    {
+                        ptg_step_t trjStep = mrpt::round(t / ptg_dt);
+
+                        // skip if this PTG path ends earlier than the specified
+                        // timestamp:
+                        const auto maxSteps = ptg->getPathStepCount(trjIdx);
+
+                        ASSERT_(maxSteps >= 1);
+                        if (trjStep >= maxSteps) continue;
+
+                        tpsPointsToConsider.emplace_back(
+                            trjIdx, trjStep, speed);
+                    }
                 }
             }
         }
@@ -1117,7 +1538,9 @@ TPS_Astar::list_paths_to_neighbors_t
             // this trajectory direction (built once above for all candidates).
             const distance_t freeDistance = tpObstacles[tpsPt.k];
 
-            if (relTrgDist >= freeDistance)
+            if (relTrgDist >= freeDistance ||
+                (startWithinClearance_ && from.state.pose == *startPose_ &&
+                 !start_edge_is_clear(*ptg, tpsPt.k, tpsPt.step)))
             {
                 // we would need to move farther away than what is possible
                 // without colliding: discard this trajectory.
@@ -1201,6 +1624,75 @@ TPS_Astar::list_paths_to_neighbors_t
     return neighbors;
 }
 
+bool TPS_Astar::start_edge_is_clear(
+    const ptg_t& ptg, trajectory_index_t k, uint32_t step) const
+{
+    double maxR = 0;
+    if (const auto* r = std::get_if<robot_radius_t>(&startRobotShape_))
+    {
+        maxR = *r;
+    }
+    else if (
+        const auto* poly =
+            std::get_if<mrpt::math::TPolygon2D>(&startRobotShape_))
+    {
+        for (const auto& v : *poly) { mrpt::keep_max(maxR, v.norm()); }
+    }
+    const double thr     = startSweepThreshold_;
+    const double rejectR = maxR + thr;
+
+    // Only obstacles reachable by the footprint along this edge:
+    const double reach = ptg.getPathDist(k, step) + rejectR + 0.5;
+    std::vector<mrpt::math::TPoint2D> pts;
+    // Per point: the threshold, lowered for points that already touch the
+    // footprint at the start, which may not get any closer (checked at each
+    // step without the margin for the motion in between, which would forbid
+    // sliding along them):
+    std::vector<double> thrs;
+    std::vector<bool>   touching;
+    for (size_t i = 0; i < startLocalObstacles_.size(); i++)
+    {
+        const auto& p = startLocalObstacles_[i];
+        if (p.sqrNorm() > reach * reach) { continue; }
+        pts.push_back(p);
+        const bool t = !startObstacleDist0_.empty() &&
+                       startObstacleDist0_[i] < kStartTouchTolerance;
+        touching.push_back(t);
+        thrs.push_back(t ? startObstacleDist0_[i] - kStartTouchTolerance : thr);
+    }
+
+    // Checked at every PTG step, with the threshold increased by half the max
+    // displacement of any footprint point since the previous step, so the
+    // motion in between cannot get closer than `thr` unnoticed:
+    mrpt::math::TPose2D prevPose = ptg.getPathPose(k, 0);
+    for (uint32_t s = 1; s <= step; s++)
+    {
+        const auto   pose = ptg.getPathPose(k, s);
+        const double disp =
+            std::hypot(pose.x - prevPose.x, pose.y - prevPose.y) +
+            std::abs(mrpt::math::angDistance(pose.phi, prevPose.phi)) * maxR;
+        prevPose          = pose;
+        const double rejS = rejectR + 0.5 * disp;
+        const double c    = std::cos(pose.phi);
+        const double sn   = std::sin(pose.phi);
+        for (size_t i = 0; i < pts.size(); i++)
+        {
+            const auto&  p  = pts[i];
+            const double dx = p.x - pose.x;
+            const double dy = p.y - pose.y;
+            const double qx = c * dx + sn * dy;
+            const double qy = -sn * dx + c * dy;
+            if (qx * qx + qy * qy > rejS * rejS) { continue; }
+            if (signedDistanceToShape(qx, qy, startRobotShape_) <=
+                thrs[i] + (touching[i] ? 0.0 : 0.5 * disp))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 mrpt::maps::CPointsMap::Ptr TPS_Astar::cached_local_obstacles(
     const mrpt::math::TPose2D&                      queryPose,
     const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
@@ -1251,6 +1743,64 @@ size_t TPS_Astar::local_obstacles_to_buffers(
         inv.composePoint(xs[i], ys[i], ox, oy);
         localObsX_[i] = static_cast<float>(ox);
         localObsY_[i] = static_cast<float>(oy);
+    }
+
+    // From the start pose: if it is closer than the clearance to some
+    // obstacle, use an exact sweep instead (see start_edge_is_clear()), so the
+    // robot can still move away from it:
+    if (startPose_.has_value() && queryPose == *startPose_ &&
+        startClearance_ > 0)
+    {
+        double dMin = std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < n; i++)
+        {
+            mrpt::keep_min(
+                dMin, signedDistanceToShape(
+                          localObsX_[i], localObsY_[i], startRobotShape_));
+        }
+        startObstacleDist0_.clear();
+        if (dMin < startClearance_)
+        {
+            if (!startWithinClearance_)
+            {
+                MRPT_LOG_DEBUG_STREAM(
+                    "Start pose is " << dMin
+                                     << " m from obstacles, closer than the "
+                                        "clearance: using an exact sweep for "
+                                        "edges leaving it.");
+            }
+            startWithinClearance_ = true;
+            startLocalObstacles_.resize(n);
+            for (size_t i = 0; i < n; i++)
+            {
+                startLocalObstacles_[i] = {localObsX_[i], localObsY_[i]};
+            }
+            if (dMin > 0)
+            {
+                startSweepThreshold_ = std::min(startClearance_, 0.5 * dMin);
+            }
+            else
+            {
+                // In contact: only move away from those obstacles.
+                MRPT_LOG_THROTTLE_WARN_STREAM(
+                    1.0, "Start pose touches obstacles ("
+                             << -dMin
+                             << " m into the footprint): only motions not "
+                                "getting closer to them are allowed.");
+                // (the others may not touch it)
+                startSweepThreshold_ = 0;
+                startObstacleDist0_.resize(n);
+                for (size_t i = 0; i < n; i++)
+                {
+                    startObstacleDist0_[i] = signedDistanceToShape(
+                        localObsX_[i], localObsY_[i], startRobotShape_);
+                }
+            }
+            // The exact sweep replaces the grid check:
+            localObsX_.clear();
+            localObsY_.clear();
+            return 0;
+        }
     }
     return n;
 }
@@ -1315,6 +1865,8 @@ bool TPS_Astar::prepare_reeds_shepp_expansion(
     for (size_t i = 0; i < trs.ptgs.size(); i++)
     {
         const auto& ptg = *trs.ptgs.at(i);
+        // (Rotations in place are not used by these shots)
+        if (dynamic_cast<const ptg::DiffDrive_Spin*>(&ptg)) { continue; }
         if (!dynamic_cast<const ptg::DiffDrive_C*>(&ptg)) { return false; }
         const auto n = ptg.getPathCount();
         if (n < 3 || n % 2 == 0) { return false; }
@@ -1344,6 +1896,30 @@ bool TPS_Astar::prepare_reeds_shepp_expansion(
     if (!rsForward_.valid || !rsReverse_.valid) { return false; }
     rsExpansionRadius_ = radius;
     return true;
+}
+
+bool TPS_Astar::prepare_spin_expansion(const TrajectoriesAndRobotShape& trs)
+{
+    spinShotForward_   = RsExpansionPtg();
+    spinShotReverse_   = RsExpansionPtg();
+    spinShotAvailable_ = false;
+    if (!spinPtgIndex_) { return false; }
+    for (size_t i = 0; i < trs.ptgs.size(); i++)
+    {
+        const auto& ptg = *trs.ptgs.at(i);
+        if (!dynamic_cast<const ptg::DiffDrive_C*>(&ptg)) { continue; }
+        const auto n = ptg.getPathCount();
+        if (n % 2 == 0) { continue; }
+        RsExpansionPtg m;
+        m.ptgIndex     = i;
+        m.kStraight    = static_cast<trajectory_index_t>((n - 1) / 2);
+        const auto tw  = ptg.getPathTwist(m.kStraight, 0);
+        m.valid        = std::abs(tw.omega) < 1e-9 && tw.vx != 0;
+        auto& existing = tw.vx > 0 ? spinShotForward_ : spinShotReverse_;
+        if (m.valid && !existing.valid) { existing = m; }
+    }
+    spinShotAvailable_ = spinShotForward_.valid || spinShotReverse_.valid;
+    return spinShotAvailable_;
 }
 
 void TPS_Astar::prepare_point_goal_shots(
@@ -1407,6 +1983,95 @@ bool TPS_Astar::footprint_fits_at_goal(
         if (shape.distance(local) <= rsGoalClearance_) { return false; }
     }
     return true;
+}
+
+std::vector<TPS_Astar::RsShotEdge> TPS_Astar::goal_shot(
+    const Node& from, const SE2orR2_KinState& goal, double maxLength,
+    bool allHeadings, const TrajectoriesAndRobotShape& trs,
+    const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
+    double MAX_XY_OBSTACLES_CLIPPING_DIST, const PlannerInput& in)
+{
+    std::vector<RsShotEdge> best;
+    cost_t                  bestCost = std::numeric_limits<cost_t>::max();
+    const auto              consider = [&](std::vector<RsShotEdge>&& shot)
+    {
+        cost_t cost = 0;
+        for (const auto& e : shot) { cost += e.edge.cost; }
+        if (!shot.empty() && cost < bestCost)
+        {
+            bestCost = cost;
+            best     = std::move(shot);
+        }
+    };
+    if (rsExpansionRadius_ > 0)
+    {
+        consider(reeds_shepp_shot(
+            from, goal, maxLength, allHeadings, trs, globalObstacles,
+            MAX_XY_OBSTACLES_CLIPPING_DIST, in));
+    }
+    if (spinShotAvailable_)
+    {
+        consider(spin_shot(
+            from, goal, maxLength, trs, globalObstacles,
+            MAX_XY_OBSTACLES_CLIPPING_DIST, in));
+    }
+    return best;
+}
+
+std::vector<TPS_Astar::RsShotEdge> TPS_Astar::spin_shot(
+    const Node& from, const SE2orR2_KinState& goal, double maxLength,
+    const TrajectoriesAndRobotShape&                trs,
+    const std::vector<mrpt::maps::CPointsMap::Ptr>& globalObstacles,
+    double MAX_XY_OBSTACLES_CLIPPING_DIST, const PlannerInput& in)
+{
+    mrpt::system::CTimeLoggerEntry tle(profiler_(), "spin_shot");
+
+    const auto&  p0       = from.state.pose;
+    const auto   goalPose = goal.asSE2KinState().pose;
+    const double dist     = std::hypot(goalPose.x - p0.x, goalPose.y - p0.y);
+    if (dist > maxLength) { return {}; }
+    const double w = trs.ptgs.at(*spinPtgIndex_)->getMaxAngVel();
+
+    // Candidates, by their execution time:
+    std::vector<std::pair<double, std::vector<ReedsSheppSegment>>> candidates;
+    constexpr double kAtGoalPoint = 1e-3;  // [m]
+    if (dist < kAtGoalPoint)
+    {
+        if (!goal.state.isPose()) { return {}; }
+        const double a = mrpt::math::wrapToPi(goalPose.phi - p0.phi);
+        candidates.push_back({std::abs(a) / w, {{'P', a}}});
+    }
+    else
+    {
+        const double bearing = std::atan2(goalPose.y - p0.y, goalPose.x - p0.x);
+        for (const bool forward : {true, false})
+        {
+            const auto& m = forward ? spinShotForward_ : spinShotReverse_;
+            if (!m.valid) { continue; }
+            const double heading =
+                forward ? bearing : mrpt::math::wrapToPi(bearing + M_PI);
+            const double a1 = mrpt::math::wrapToPi(heading - p0.phi);
+            const double a2 = goal.state.isPose()
+                                  ? mrpt::math::wrapToPi(goalPose.phi - heading)
+                                  : 0.0;
+            const double v  = std::abs(
+                 trs.ptgs.at(m.ptgIndex)->getPathTwist(m.kStraight, 0).vx);
+            candidates.push_back(
+                {(std::abs(a1) + std::abs(a2)) / w + dist / v,
+                 {{'P', a1}, {'S', forward ? dist : -dist}, {'P', a2}}});
+        }
+    }
+    std::sort(
+        candidates.begin(), candidates.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& c : candidates)
+    {
+        auto out = execute_shot(
+            from, c.second, goal, trs, globalObstacles,
+            MAX_XY_OBSTACLES_CLIPPING_DIST, in);
+        if (!out.empty()) { return out; }
+    }
+    return {};
 }
 
 std::vector<TPS_Astar::RsShotEdge> TPS_Astar::reeds_shepp_shot(
@@ -1486,7 +2151,28 @@ std::vector<TPS_Astar::RsShotEdge> TPS_Astar::execute_shot(
     SE2_KinState       state = from.state;
     for (const auto& seg : segments)
     {
-        const auto& m   = seg.length > 0 ? rsForward_ : rsReverse_;
+        if (seg.type == 'P')
+        {
+            ASSERT_(spinPtgIndex_.has_value());
+            const auto& spin = dynamic_cast<const ptg::DiffDrive_Spin&>(
+                *trs.ptgs.at(*spinPtgIndex_));
+            const auto ks = spin.rotationToTrajectoryStep(seg.length);
+            if (!ks) { continue; }  // (negligible rotation)
+            const ptg_t& ptg = spin;
+            SE2_KinState next;
+            next.pose = state.pose + ptg.getPathPose(ks->first, ks->second);
+            (next.vel = ptg.getPathTwist(ks->first, ks->second))
+                .rotate(state.pose.phi);
+            chunks.push_back(
+                {*spinPtgIndex_, ks->first, ks->second, state, next});
+            state = next;
+            continue;
+        }
+        // (Straight segments of spin shots may use other C-PTGs)
+        const auto& m =
+            seg.length > 0 ? (rsForward_.valid ? rsForward_ : spinShotForward_)
+                           : (rsReverse_.valid ? rsReverse_ : spinShotReverse_);
+        ASSERT_(m.valid);
         const auto& ptg = *trs.ptgs.at(m.ptgIndex);
         const auto  k   = seg.type == 'L'   ? m.kLeft
                           : seg.type == 'R' ? m.kRight
@@ -1569,6 +2255,11 @@ std::vector<TPS_Astar::RsShotEdge> TPS_Astar::execute_shot(
                 localObsX_.data(), localObsY_.data(), nObs, tpObstacles);
         }
         if (ptg.getPathDist(ch.k, ch.step) >= (*freeDist)[ch.k]) { return {}; }
+        if (startWithinClearance_ && ch.from.pose == *startPose_ &&
+            !start_edge_is_clear(ptg, ch.k, ch.step))
+        {
+            return {};
+        }
     }
 
     std::vector<RsShotEdge> out;

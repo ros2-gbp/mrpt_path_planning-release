@@ -19,8 +19,21 @@
 #include <mrpt/system/COutputLogger.h>
 
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <optional>
 #include <vector>
+
+/** Feature macro: TrajectoryFollower::updateTrajectory() exists. */
+#define MPP_HAS_FOLLOWER_UPDATE_TRAJECTORY 1
+
+/** Feature macro: TrajectoryFollower rotates in place at path pivots (see
+ * TrajectoryFollower::Parameters::pivot_in_place). */
+#define MPP_HAS_FOLLOWER_PIVOTS 1
+
+/** Feature macro: TrajectoryFollower::setSpeedCap() exists, and its Output
+ * has the wanted curvature and gear. */
+#define MPP_HAS_FOLLOWER_SPEED_CAP 1
 
 namespace mpp
 {
@@ -36,7 +49,11 @@ enum class FollowerStatus : uint8_t
      * in the safety stage; never emitted by the pursuit core alone). */
     Blocked,
     /** Cross-track error exceeded the configured limit. */
-    OffPathExceeded
+    OffPathExceeded,
+    /** Stopped at its closest approach to the goal (see `arrival_radius`),
+     * but with a heading error above `arrival_ang_tol`; or stopped past the
+     * path end, moving away from a goal farther than `arrival_radius`. */
+    MissedGoal
 };
 
 /** Pure-pursuit trajectory follower core with predictive safety (ROS-free).
@@ -50,6 +67,10 @@ enum class FollowerStatus : uint8_t
  * Feedback: path progress is measured on the map-frame localization; the
  * emitted chunk is expressed in the odom frame (via the current map->odom
  * correction) so relocalization jumps do not lurch the wheels.
+ *
+ * Rotations in place: a vehicle that can turn in place stops at the path
+ * points where the heading changes without moving (e.g. planned with the
+ * DiffDrive_Spin PTG), rotates there, and goes on (see `pivot_in_place`).
  *
  * Predictive safety: if a robot footprint and live obstacle points are set
  * (\ref setRobotShape / \ref setObstacles), each cycle the follower sweeps the
@@ -70,6 +91,42 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         double max_accel         = 0.5;  //!< [m/s^2]
         double max_decel         = 0.7;  //!< [m/s^2] (goal + speed reductions)
         double max_lateral_accel = 1.0;  //!< [m/s^2] curvature speed limit
+
+        /** [s] Time constant of the platform speed response (e.g. a heavy
+         * vehicle whose speed controller behaves as a first-order lag): after
+         * a stop command it keeps moving about |v| * actuation_lag. Stops at
+         * the goal and at cusps are planned that much earlier, so the vehicle
+         * actually stops there instead of overshooting. 0 (default): an
+         * ideal platform. */
+        double actuation_lag = 0.0;
+
+        /** [s] Dead time between the pose given to step() and the effect of
+         * the commands it returns: odometry age plus command transport and
+         * actuation delays. The control pose is predicted this far ahead
+         * with the commands already sent, so that curvature changes and
+         * stops are commanded on time. 0 (default): no prediction. */
+        double control_delay = 0.0;
+
+        /** If true (default), the speed is also limited ahead of time by the
+         * path curvature (max_lateral_accel, max_omega) up to the braking
+         * distance ahead, so the vehicle has already slowed down when it
+         * enters a curve, whatever its speed. Without it, curvature only
+         * limits the speed once the vehicle is in the curve, which is too late
+         * at high speeds and leads to overshooting it. */
+        bool curvature_preview = true;
+
+        /** If true (default), the commanded curvature is the reference path
+         * curvature at the vehicle plus a pure-pursuit correction of the
+         * deviation from the path (zero when on it). Pure pursuit alone
+         * starts turning as soon as its lookahead point enters a curve, and
+         * so cuts it. */
+        bool curvature_feedforward = true;
+
+        /** [rad/s] If > 0, max commanded angular speed. Enforced by lowering
+         * the linear speed (the commanded curvature is kept), so the path
+         * geometry is preserved on tight curves or near the goal, where pure
+         * pursuit may ask for a large curvature. <= 0 disables the limit. */
+        double max_omega = 0.0;
 
         /** [m] If > 0, the tightest turn radius the vehicle can physically
          * make (e.g. an Ackermann robot's steering-limited minimum radius).
@@ -217,8 +274,35 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         /** [m] Once the robot settles within this distance of the goal and has
          * passed its closest approach, it latches "arrived" and holds a stop,
          * so it never drives back away from a goal it cannot perfectly seat (no
-         * runaway / thrashing on a kinematically infeasible final pose). */
+         * runaway / thrashing on a kinematically infeasible final pose). If it
+         * instead passes the path end farther than this from the goal, it
+         * also stops there, reporting `MissedGoal`. */
         double arrival_radius = 0.3;
+
+        /** [rad] If > 0, settling at the closest approach (see
+         * `arrival_radius`) with a larger heading error than this reports
+         * `MissedGoal` instead of `ReachedGoal`, so the caller can replan a
+         * corrective maneuver. <= 0: always `ReachedGoal` (best-effort
+         * heading). */
+        double arrival_ang_tol = 0.0;
+
+        /** If true, a vehicle that can turn in place (differential drive,
+         * i.e. `min_turn_radius` <= 0; ignored otherwise) finishes by rotating
+         * in place to the goal heading once it is at the goal position (or
+         * settled within `arrival_radius`), if the footprint is free of
+         * obstacles along that rotation. Default: false. */
+        bool rotate_at_goal = false;
+
+        /** If true (default), a vehicle that can turn in place (i.e.
+         * `min_turn_radius` <= 0; ignored otherwise) executes the pivots of
+         * the path (heading changes of 10 degrees or more within 1 cm, e.g.
+         * planned with the DiffDrive_Spin PTG) by stopping there and rotating
+         * in place, in the same direction as the path, if the footprint is
+         * clear of obstacles along the rotation (else, it waits there, until
+         * `block_timeout`). A pivot at the end of the path is always
+         * executed, regardless of `rotate_at_goal`. If false, pivots are
+         * merged with the rest of the path (corners for pure pursuit). */
+        bool pivot_in_place = true;
 
         double control_period = 0.05;  //!< [s] nominal call period (20 Hz)
         double horizon        = 1.5;  //!< [s] emitted chunk length
@@ -234,7 +318,10 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         double safety_margin = 0.05;
 
         /** [m] If the nearest predicted contact is within this travel distance,
-         * command a full stop (speed scale 0). */
+         * command a full stop (speed scale 0). Beyond it, the speed is also
+         * capped so that the vehicle can always brake (at `max_decel`) before
+         * reaching this distance to the contact, so the behavior is consistent
+         * at any speed. */
         double stop_distance = 0.3;
 
         /** [m] If the nearest predicted contact is beyond this travel distance,
@@ -247,7 +334,8 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         double safety_horizon = 3.0;
 
         /** [m] How far ahead along the reference path to sweep the footprint.
-         */
+         * It is automatically extended to cover the braking distance at the
+         * current speed. */
         double reference_lookahead_dist = 2.5;
 
         /** [m] Step used to sample the footprint boundary and to march the
@@ -257,6 +345,15 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         /** Speed scale that must be recovered before resuming after a safety
          * stop (hysteresis to avoid chattering). */
         double resume_scale = 0.2;
+
+        /** [m/s] If the predictive safety caps the speed below this, the
+         * vehicle stops (a safety stop, see `resume_scale` and
+         * `block_timeout`) instead of crawling toward the predicted contact:
+         * the speed cap decreases with the distance to it, so the vehicle
+         * would otherwise be commanded ever slower speeds (which a real
+         * platform may not even execute) without ever stopping, and never be
+         * reported as `Blocked`. 0: stop only at a zero speed cap. */
+        double safety_min_speed = 0.05;
 
         /** [s] If held stopped by the safety layer longer than this, report
          * `Blocked`. */
@@ -270,8 +367,20 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
     Parameters params;
 
     /** Sets/replaces the reference path (hot-swappable at any time); resets
-     * arc-length progress. Needs >= 2 points to track. */
+     * arc-length progress. Needs >= 2 points to track, or a pivot (see
+     * `pivot_in_place`). */
     void setTrajectory(const Trajectory& traj);
+
+    /** Replaces the reference path while following a previous one that it
+     * continues (e.g. a replanned path keeping the part of the current one
+     * the robot is on), without restarting the motion: the commanded speed,
+     * angular velocity, curvature and control pose are kept, so the robot
+     * does not slow down. Progress continues from the point of the new path
+     * matching the current progress point on the old one (or, if none
+     * matches, the projection of the control pose). Without a current path,
+     * it is the same as setTrajectory().
+     * Feature macro: MPP_HAS_FOLLOWER_UPDATE_TRAJECTORY. */
+    void updateTrajectory(const Trajectory& traj);
 
     /** Clears the trajectory and progress. */
     void reset();
@@ -287,7 +396,20 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
     /** Convenience overload: obstacle points as (x,y) in the map frame. */
     void setObstacles(const std::vector<mrpt::math::TPoint2D>& obstacles);
 
-    bool   hasTrajectory() const { return traj_.size() >= 2; }
+    /** [m/s] Sets an external cap on the speed, e.g. the safe speed that a
+     * CollisionGuard reports for the wanted motion (Output::curvature,
+     * Output::gear), applied in the next step()s like a predictive safety
+     * slowdown (so it may stop the vehicle and report `Blocked`). +inf: no
+     * cap (reset by setTrajectory(), kept by updateTrajectory()). */
+    void setSpeedCap(double maxSpeed) { speedCap_ = maxSpeed; }
+
+    bool hasTrajectory() const
+    {
+        return !legs_.empty() &&
+               (traj_.size() >= 2 || legs_[legIdx_].pivotTo.has_value());
+    }
+    /** Length of the path being tracked, up to its next pivot (see
+     * `pivot_in_place`), if any. */
     double totalLength() const { return cumS_.empty() ? 0.0 : cumS_.back(); }
 
     struct Output
@@ -297,32 +419,88 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         FollowerStatus status = FollowerStatus::Idle;
 
         // Debug / introspection:
-        double               arc_length_s    = 0;
-        double               cross_track_err = 0;  //!< signed [m]
-        double               heading_err     = 0;  //!< [rad]
-        double               target_speed    = 0;  //!< [m/s] immediate command
+        double arc_length_s    = 0;
+        double cross_track_err = 0;  //!< signed [m]
+        double heading_err     = 0;  //!< [rad]
+        double target_speed    = 0;  //!< [m/s] immediate command
+        /** [1/m] Path curvature of the immediate command, also while
+         * stopped (the one it would drive). */
+        double curvature = 0;
+        /** Travel direction of the immediate command: +1 forward, -1 in
+         * reverse, 0 if not driving along the path (e.g. rotating in place).
+         */
+        double               gear = 0;
         mrpt::math::TPoint2D lookahead_point{0, 0};
 
         /** Safety speed scale applied this cycle (1 = unrestricted, 0 = stopped
          * by the predictive safety layer). */
         double safety_scale = 1.0;
+
+        /** [m] Travel distance to the first predicted contact along the
+         * command forecast and along the reference path (+inf if none). */
+        double contact_dist_forecast  = std::numeric_limits<double>::infinity();
+        double contact_dist_reference = std::numeric_limits<double>::infinity();
     };
 
     /** One control cycle: given the latest localization (map) and odometry
      * (odom), computes and returns the command chunk + status. Does not itself
      * call the vehicle interface; the node does `iface.follow(out.command)` (or
-     * `iface.stop()` on ReachedGoal). */
+     * `iface.stop()` on ReachedGoal). ReachedGoal and MissedGoal are
+     * terminal: they are returned (with no command) until a new trajectory is
+     * set, wherever the robot is moved afterwards. */
     Output step(
         const VehicleLocalizationState& loc, const VehicleOdometryState& odo);
 
    private:
-    Trajectory          traj_;
+    Output stepImpl(
+        const VehicleLocalizationState& loc, const VehicleOdometryState& odo);
+
+    /** A part of the reference path between pivots (see `pivot_in_place`):
+     * first, an optional rotation in place to `pivotTo` (in the direction
+     * of `pivotDir`), then the path (if it has 2 or more points). */
+    struct Leg
+    {
+        std::optional<double> pivotTo;  //!< heading [rad]
+        double                pivotDir = 1;  //!< +1: left, -1: right
+        Trajectory            path;
+    };
+    std::vector<Leg> legs_;
+    std::size_t      legIdx_ = 0;  //!< the current leg, in legs_
+    bool pivoting_ = false;  //!< rotating at the start of the current leg
+
+    /** Makes legs_[idx] the current leg (a pivot, if any, first), keeping the
+     * motion state. */
+    void startLeg(std::size_t idx);
+
+    /** Sets the path tracked by the pursuit, resetting the progress on it. */
+    void setLegPath(const Trajectory& traj);
+
+    /** One cycle of the rotation in place at the start of the current leg.
+     * \return nullopt once it is done. */
+    std::optional<Output> pivotStep(
+        const mrpt::math::TPose2D&      ctrlPose,
+        const VehicleLocalizationState& loc, const VehicleOdometryState& odo,
+        mrpt::system::TTimeStamp now);
+
+    /** A command to rotate in place at `omega` [rad/s] (0: stand still). */
+    SampledTrajectory inPlaceCommand(
+        const mrpt::math::TPose2D&      ctrlPose,
+        const VehicleLocalizationState& loc, const VehicleOdometryState& odo,
+        double omega) const;
+
+    Trajectory          traj_;  //!< path of the current leg
     std::vector<double> cumS_;  //!< cumulative arc-length per point
+    std::vector<double> knotCurv_;  //!< |path curvature| per point [1/m]
+    /** Signed curvature of the path tangent [1/m] just before and just
+     * after each point (see refCurvatureAt()), and the arc-length over which
+     * each applies [m]. */
+    std::vector<double> curvBefore_, curvAfter_, spanBefore_, spanAfter_;
     std::vector<double>
         cuspS_;  //!< arc-lengths where travel direction reverses
     std::vector<std::size_t>
            cuspIdx_;  //!< traj_ knot index for each entry in cuspS_
-    double lastS_ = 0;  //!< monotonic progress (map projection)
+    double lastS_ =
+        0;  //!< progress: arc-length of the path projection (can go back a bit)
 
     /** Driving gear (+1 forward, -1 reverse) for each cusp-bounded interval
      * of the path (size == cuspS_.size() + 1); see \ref advanceGear. */
@@ -356,6 +534,17 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
      * cannot perfectly seat. */
     bool arrived_ = false;
 
+    /** Set if `arrived_` was latched past the path end, farther than
+     * `arrival_radius` from the goal: reported as `MissedGoal`. */
+    bool overshotGoal_ = false;
+
+    /** Rotating in place at the goal (see Parameters::rotate_at_goal). */
+    bool rotatingAtGoal_ = false;
+
+    /** The terminal status (ReachedGoal or MissedGoal) of the current
+     * trajectory, once reported. */
+    std::optional<FollowerStatus> finalStatus_;
+
     /** Closest distance to the goal point reached so far, used to detect when
      * the robot has passed its closest approach and would start driving away.
      */
@@ -376,11 +565,28 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
 
     bool ctrlPoseInit_ = false;
 
+    /** Commands (v, omega) of the last control cycles, newest last, for the
+     * \ref Parameters::control_delay prediction. */
+    std::deque<std::pair<double, double>> recentCmds_;
+
+    /** Recent odometry poses, to bring delayed localizations to the present
+     * (see compensateLatency()). */
+    std::deque<std::pair<mrpt::system::TTimeStamp, mrpt::poses::CPose2D>>
+        odoHistory_;
+
+    /** The localization pose moved forward from its own timestamp to the
+     * odometry timestamp, with the odometry motion in between. Returns the
+     * raw localization pose if either timestamp is missing, and nothing if
+     * the localization is older than the odometry history. */
+    std::optional<mrpt::math::TPose2D> compensateLatency(
+        const VehicleLocalizationState& loc, const VehicleOdometryState& odo);
+
     // Predictive safety state:
     std::vector<mrpt::math::TPoint2D>
                                  shapeSamples_;  //!< footprint, robot frame
     mrpt::maps::CSimplePointsMap obstacles_;  //!< map frame (kd-tree)
-    bool stopped_ = false;  //!< safety-stop hysteresis latch
+    bool   stopped_  = false;  //!< safety-stop hysteresis latch
+    double speedCap_ = std::numeric_limits<double>::infinity();  //!< [m/s]
     mrpt::system::TTimeStamp stoppedSince_ = INVALID_TIMESTAMP;
 
     struct Projection
@@ -404,11 +610,25 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
 
     /** Smooth control pose (map frame): \ref ctrlPose_ dead-reckoned with the
      * latest wheel-odometry increment, then corrected toward the raw
-     * localization by a complementary filter applied at the vehicle; mutates
-     * the filter state. Falls back to the raw localization pose when no
-     * odometry is available. */
+     * localization by a complementary filter applied at the vehicle (unless
+     * `correct` is false: dead-reckoning only); mutates the filter state. Falls
+     * back to the raw localization pose when no odometry is available. */
     mrpt::math::TPose2D controlPose(
-        const VehicleLocalizationState& loc, const VehicleOdometryState& odo);
+        const VehicleLocalizationState& loc, const VehicleOdometryState& odo,
+        bool correct = true);
+
+    /** Reference path curvature [1/m] at arc-length `s`, for the driving
+     * `gear` (+1 forward, -1 reverse). */
+    double refCurvatureAt(double s, double gear) const;
+
+    /** Pure-pursuit curvature [1/m] from `fromPose`, whose projection on the
+     * path is at arc-length `sStart`, with the lookahead point (output, also
+     * its arc-length, distance `Ld` and lateral offset `yr` in the vehicle
+     * frame) placed within `[sStart, capS]`. */
+    double pursuitCurvature(
+        const mrpt::math::TPose2D& fromPose, double sStart, double capS,
+        mrpt::math::TPoint2D& lookahead, double& lookaheadS, double& Ld,
+        double& yr) const;
 
     /** Curvature-adaptive lookahead arc-length: marches forward from `sStart`
      * accumulating the path's |turned angle| and returns the arc-length where
@@ -454,28 +674,45 @@ class TrajectoryFollower : public mrpt::system::COutputLogger
         double gear, double speedScale = 1.0) const;
 
     /** Pose (x,y + tangent heading) on the reference polyline at arc-length
-     * `s`. */
+     * `s`. The tangent turns as the curvature of refCurvatureAt() (so it is
+     * continuous, not that of the polyline segments). */
     mrpt::math::TPose2D poseAtArc(double s) const;
+
+    /** Pose of the vehicle body at arc-length `s` on the reference path: the
+     * position, and the heading interpolated from the reference poses (which,
+     * unlike the path tangent, is the body heading also on reverse
+     * segments). */
+    mrpt::math::TPose2D bodyPoseAtArc(double s) const;
 
     /** Min distance from the footprint (at map-frame pose `p`) to the nearest
      * obstacle point; +inf if no obstacles are set. */
     double footprintClearance(const mrpt::math::TPose2D& p) const;
 
     /** Rolls the command forecast forward from `startPose` (map frame) and
-     * returns the travel distance to the first predicted footprint contact;
-     * +inf if none within `safety_horizon`. `gear` is the interval gear
-     * already latched by \ref advanceGear for this cycle (the forecast does
-     * not re-decide it per predicted sample). */
+     * returns the travel distance to the first predicted footprint contact,
+     * i.e. a footprint clearance at or below `contactClearance`; +inf if none
+     * within `safety_horizon`. `gear` is the interval gear already latched by
+     * \ref advanceGear for this cycle (the forecast does not re-decide it per
+     * predicted sample). */
     double forecastContactDistance(
         const mrpt::math::TPose2D& startPose, double startV, double startOmega,
-        double startCurv, double startS, double gear) const;
+        double startCurv, double startS, double gear,
+        double contactClearance) const;
 
-    /** Sweeps the footprint along the reference path ahead of `startS` and
-     * returns the travel distance to the first predicted contact; +inf if none
-     * within `reference_lookahead_dist`. */
-    double referenceContactDistance(double startS) const;
+    /** Sweeps the footprint along the reference path ahead of `startS`, up to
+     * `maxDist`, and returns the travel distance to the first predicted
+     * contact (see forecastContactDistance()); +inf if none. */
+    double referenceContactDistance(
+        double startS, double maxDist, double contactClearance) const;
 
-    /** Maps a nearest-contact travel distance to a [0,1] speed scale. */
+    /** Max speed at arc-length `s` such that the vehicle can brake (at
+     * max_decel) to the curvature speed limit of every point ahead, up to
+     * `sMax` (see Parameters::curvature_preview). */
+    double curvaturePreviewCap(double s, double sMax) const;
+
+    /** Maps a nearest-contact travel distance to a [0,1] speed scale: linear
+     * between stop_distance and slow_distance, and never above the speed
+     * from which the vehicle can still brake before stop_distance. */
     double contactDistanceToScale(double d) const;
 };
 

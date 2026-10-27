@@ -36,11 +36,11 @@ trajectory_t mpp::plan_to_trajectory(
             ptgTrim)
             ptgTrim->trimmableSpeed_ = edge->ptgTrimmableSpeed;
 
-        uint32_t ptgFinalStep = 0;
-        bool     ok           = ptg->getPathStepForDist(
-                          edge->ptgPathIndex, edge->ptgDist, ptgFinalStep);
-        ASSERT_(ok);
-        uint32_t stepIncr =
+        const auto ptgFinalStepOpt =
+            ptg->getPathStepForDist(edge->ptgPathIndex, edge->ptgDist);
+        ASSERT_(ptgFinalStepOpt.has_value());
+        const uint32_t ptgFinalStep = *ptgFinalStepOpt;
+        uint32_t       stepIncr =
             std::max<uint32_t>(1, mrpt::round(samplePeriod / ptg_dt));
 
         for (uint32_t step = 0;; step += stepIncr)
@@ -52,7 +52,10 @@ trajectory_t mpp::plan_to_trajectory(
             // populate it:
             ts.state.pose =
                 endOfLastEdge + ptg->getPathPose(edge->ptgPathIndex, step);
+            // Twist in the global frame of the trajectory (the PTG gives it in
+            // the edge start frame):
             ts.state.vel = ptg->getPathTwist(edge->ptgPathIndex, step);
+            ts.state.vel = ts.state.vel.rotated(endOfLastEdge.phi);
 
             ts.ptgIndex     = edge->ptgIndex;
             ts.ptgPathIndex = edge->ptgPathIndex;
@@ -79,7 +82,7 @@ bool mpp::save_to_txt(const trajectory_t& traj, const std::string& fileName)
         " %15s %15s %15s\n",  //
         "Time [s]",  //
         "x_global [m]", "y_global [m]", "phi [rad]",  //
-        "vx_local [m]", "vy_local[m]", "omega [rad/s]",  //
+        "vx_global [m/s]", "vy_global[m/s]", "omega [rad/s]",  //
         "PTG_index", "PTG_traj_index", "PTG_step");
 
     for (const auto& kv : traj)

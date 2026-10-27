@@ -6,10 +6,11 @@
 
 #include <mpp/algos/CostEvaluatorCostMap.h>
 #include <mpp/algos/CostEvaluatorPreferredWaypoint.h>
+#include <mpp/algos/CostEvaluatorReverseMotion.h>
+#include <mpp/algos/CostEvaluatorTurning.h>
 #include <mpp/algos/TPS_Astar.h>
-#include <mpp/interfaces/TargetApproachController.h>
-#include <mpp/interfaces/VehicleMotionInterface.h>
 #include <mpp/ptgs/DiffDrive_C.h>
+#include <mpp/ptgs/DiffDrive_Spin.h>
 #include <mpp/ptgs/HolonomicBlend.h>
 #include <mrpt/core/initializer.h>
 
@@ -22,16 +23,17 @@ MRPT_INITIALIZER(selfdriving_register)
     registerClass(CLASS_ID(CostEvaluator));
     registerClass(CLASS_ID(CostEvaluatorCostMap));
     registerClass(CLASS_ID(CostEvaluatorPreferredWaypoint));
+    registerClass(CLASS_ID(CostEvaluatorReverseMotion));
+    registerClass(CLASS_ID(CostEvaluatorTurning));
 
     // Planners:
     registerClass(CLASS_ID(Planner));
     registerClass(CLASS_ID(TPS_Astar));
 
     // Interfaces:
-    registerClass(CLASS_ID(VehicleMotionInterface));
-    registerClass(CLASS_ID(TargetApproachController));
 
     // PTGs:
     registerClass(CLASS_ID(ptg::HolonomicBlend));
     registerClass(CLASS_ID(ptg::DiffDrive_C));
+    registerClass(CLASS_ID(ptg::DiffDrive_Spin));
 }

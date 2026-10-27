@@ -14,6 +14,7 @@
 #include <mrpt/typemeta/TEnumType.h>
 #include <mrpt/version.h>
 
+#include <functional>
 #include <optional>
 #include <utility>
 
@@ -59,6 +60,17 @@ class DiffDriveCollisionGridBased : public mrpt::nav::CPTG_RobotShape_Polygonal
     virtual void ptgDiffDriveSteeringFunction(
         float alpha, float t, float x, float y, float phi, float& v,
         float& w) const = 0;
+
+    /** Optional end condition of a trajectory, checked at each integration
+     * step besides the time, distance and turned angle limits. Default: none.
+     */
+    virtual bool ptgDiffDriveTrajectoryEnded(
+        [[maybe_unused]] float alpha, [[maybe_unused]] float t,
+        [[maybe_unused]] float x, [[maybe_unused]] float y,
+        [[maybe_unused]] float phi) const
+    {
+        return false;
+    }
 
     /** @name Virtual interface of each PTG implementation
      *  @{ */
@@ -138,6 +150,17 @@ class DiffDriveCollisionGridBased : public mrpt::nav::CPTG_RobotShape_Polygonal
      * range) [m]. */
     double getObstacleReachDistance() const;
 
+    /** Sets a function called by initialize() as soon as it is known whether
+     * the collision grid is loaded from the cache file (true) or has to be
+     * built (false), which happens before the slow part. It is meant to be
+     * set only while initializing (see
+     * TrajectoriesAndRobotShape::initFromConfigFile()), and reset (empty)
+     * afterwards. */
+    void setGridInitCallback(std::function<void(bool fromCache)> callback)
+    {
+        m_gridInitCallback = std::move(callback);
+    }
+
    protected:
     DiffDriveCollisionGridBased();
 
@@ -183,6 +206,7 @@ class DiffDriveCollisionGridBased : public mrpt::nav::CPTG_RobotShape_Polygonal
     std::vector<TCPointVector> m_trajectory;
     double                     m_resolution{0.05};
     double                     m_clearance{0.0};
+    std::function<void(bool)>  m_gridInitCallback;
     double                     m_robotRadius{0.0};  //!< set at initialize()
 
     /** Whether an obstacle point (vehicle frame) is inside the footprint. */
@@ -210,27 +234,26 @@ class DiffDriveCollisionGridBased : public mrpt::nav::CPTG_RobotShape_Polygonal
     /** An internal class for storing the collision grid  */
     class CCollisionGrid : public mrpt::containers::CDynamicGrid<TCollisionCell>
     {
-       private:
-        DiffDriveCollisionGridBased const* m_parent;
-
        public:
         CCollisionGrid(
             float x_min, float x_max, float y_min, float y_max,
-            float resolution, DiffDriveCollisionGridBased* parent)
+            float resolution)
             : mrpt::containers::CDynamicGrid<TCollisionCell>(
-                  x_min, x_max, y_min, y_max, resolution),
-              m_parent(parent)
+                  x_min, x_max, y_min, y_max, resolution)
         {
         }
         ~CCollisionGrid() override = default;
-        /** Save to file, true = OK */
+        /** Save to file, true = OK. `parent` is the PTG owning this grid
+         * (not stored, so that PTGs can be copied). */
         bool saveToFile(
-            mrpt::serialization::CArchive* fil,
-            const mrpt::math::CPolygon&    computed_robotShape) const;
+            const DiffDriveCollisionGridBased& parent,
+            mrpt::serialization::CArchive*     fil,
+            const mrpt::math::CPolygon&        computed_robotShape) const;
         /** Load from file,  true = OK */
         bool loadFromFile(
-            mrpt::serialization::CArchive* fil,
-            const mrpt::math::CPolygon&    current_robotShape);
+            const DiffDriveCollisionGridBased& parent,
+            mrpt::serialization::CArchive*     fil,
+            const mrpt::math::CPolygon&        current_robotShape);
 
         /** For an obstacle (x,y), returns a vector with all the pairs (a,d)
          * such as the robot collides */

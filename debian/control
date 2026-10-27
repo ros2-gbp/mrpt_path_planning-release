@@ -1,0 +1,12 @@
+Source: ros-rolling-mrpt-path-planning
+Section: misc
+Priority: optional
+Maintainer: "Jose-Luis Blanco-Claraco" <joseluisblancoc@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), cmake, ros-rolling-mrpt-path-planning-apps, ros-rolling-mrpt-path-planning-core, ros-rolling-ros-workspace
+Homepage: https://github.com/MRPT/mrpt_path_planning
+Standards-Version: 3.9.2
+
+Package: ros-rolling-mrpt-path-planning
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-rolling-mrpt-path-planning-apps, ros-rolling-mrpt-path-planning-core, ros-rolling-ros-workspace
+Description: Metapackage for mrpt_path_planning: depends on mrpt_path_planning_core (headless path-planning library) and mrpt_path_planning_apps (CLI/GUI applications).
